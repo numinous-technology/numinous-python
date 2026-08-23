@@ -8,10 +8,10 @@ non-preemptible.
 ## Install
 
 ```bash
+pip install numinous            # SDK + CLI from PyPI
+# or:
 curl -fsSL https://cloud.numinous.technology/install.sh | sh
 ```
-
-Installs the `numinous` CLI + Python SDK (via pipx/uv/pip, whichever exists).
 
 ## Use
 

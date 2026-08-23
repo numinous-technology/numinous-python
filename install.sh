@@ -3,7 +3,7 @@
 #   curl -fsSL https://cloud.numinous.technology/install.sh | sh
 set -eu
 
-REPO="https://github.com/numinous-technology/numinous-python"
+PKG="numinous"
 BIN_DIR="${NUMINOUS_BIN:-$HOME/.local/bin}"
 
 say() { printf '\033[1;34mnuminous\033[0m %s\n' "$*"; }
@@ -11,14 +11,14 @@ say() { printf '\033[1;34mnuminous\033[0m %s\n' "$*"; }
 command -v python3 >/dev/null 2>&1 || {
   echo "python3 is required" >&2; exit 1; }
 
-say "installing CLI from $REPO"
+say "installing $PKG from PyPI"
 
-if command -v pipx >/dev/null 2>&1; then
-  pipx install --force "numinous @ git+$REPO" >/dev/null
-elif command -v uv >/dev/null 2>&1; then
-  uv tool install --force "numinous @ git+$REPO" >/dev/null
+if command -v uv >/dev/null 2>&1; then
+  uv tool install --force "$PKG" >/dev/null
+elif command -v pipx >/dev/null 2>&1; then
+  pipx install --force "$PKG" >/dev/null
 else
-  python3 -m pip install --user --upgrade "numinous @ git+$REPO" >/dev/null
+  python3 -m pip install --user --upgrade "$PKG" >/dev/null
 fi
 
 mkdir -p "$BIN_DIR"
