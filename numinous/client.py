@@ -155,9 +155,19 @@ class Sandboxes(_Resource):
 
 
 class Volumes(_Resource):
-    def create(self, name: str, size_gib: float = 10.0) -> dict:
-        """Idempotent by name within your org; safe to call on every start."""
-        return self._c._post("/v1/volumes", {"name": name, "size_gib": size_gib})
+    def create(self, name: str, size_gib: float = 10.0,
+               kind: str = "sandbox", datacenter: str | None = None) -> dict:
+        """Idempotent by name within your org; safe to call on every start.
+
+        kind="sandbox": host-local NVMe, mounts on CPU sandboxes ($0.10/GiB-mo).
+        kind="gpu": RunPod network volume, datacenter-scoped, mounts on GPU
+        sandboxes only ($0.09/GiB-mo). The two kinds live on different
+        hardware and never cross.
+        """
+        body: dict = {"name": name, "size_gib": size_gib, "kind": kind}
+        if datacenter:
+            body["datacenter"] = datacenter
+        return self._c._post("/v1/volumes", body)
 
     def list(self) -> list[dict]:
         return self._c._get("/v1/volumes")

@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
 
     vol = sub.add_parser("volume", help="manage persistent volumes")
     vs = vol.add_subparsers(dest="vcmd", required=True)
-    vc = vs.add_parser("create"); vc.add_argument("--name", required=True); vc.add_argument("--size", type=float, default=10.0)
+    vc = vs.add_parser("create"); vc.add_argument("--name", required=True); vc.add_argument("--size", type=float, default=10.0); vc.add_argument("--kind", choices=["sandbox","gpu"], default="sandbox")
     vs.add_parser("list")
     vd = vs.add_parser("delete"); vd.add_argument("volume_id")
 
@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "usage":
             _out(nc.usage.query(label=a.label))
         elif a.cmd == "volume" and a.vcmd == "create":
-            _out(nc.volumes.create(a.name, size_gib=a.size))
+            _out(nc.volumes.create(a.name, size_gib=a.size, kind=a.kind))
         elif a.cmd == "volume" and a.vcmd == "list":
             _out(nc.volumes.list())
         elif a.cmd == "volume" and a.vcmd == "delete":
