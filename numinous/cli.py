@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     us = sub.add_parser("usage", help="usage spans by label")
     us.add_argument("--label")
 
+    vol = sub.add_parser("volume", help="manage persistent volumes")
+    vs = vol.add_subparsers(dest="vcmd", required=True)
+    vc = vs.add_parser("create"); vc.add_argument("--name", required=True); vc.add_argument("--size", type=float, default=10.0)
+    vs.add_parser("list")
+    vd = vs.add_parser("delete"); vd.add_argument("volume_id")
+
     sub.add_parser("capacity", help="free capacity")
     sub.add_parser("pricing", help="current rates")
 
@@ -109,6 +115,12 @@ def main(argv: list[str] | None = None) -> int:
             _out(nc.sandboxes.list(label=a.label, state=a.state))
         elif a.cmd == "usage":
             _out(nc.usage.query(label=a.label))
+        elif a.cmd == "volume" and a.vcmd == "create":
+            _out(nc.volumes.create(a.name, size_gib=a.size))
+        elif a.cmd == "volume" and a.vcmd == "list":
+            _out(nc.volumes.list())
+        elif a.cmd == "volume" and a.vcmd == "delete":
+            _out(nc.volumes.delete(a.volume_id))
         elif a.cmd == "capacity":
             _out(nc.capacity.get())
         elif a.cmd == "pricing":

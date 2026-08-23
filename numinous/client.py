@@ -68,7 +68,8 @@ class Sandboxes(_Resource):
                labels: dict[str, str] | None = None,
                egress: str = "allow", allow: list[str] | None = None,
                env: dict[str, str] | None = None,
-               auto_suspend_idle_seconds: int = 0) -> dict:
+               auto_suspend_idle_seconds: int = 0,
+               volumes: list[dict] | None = None) -> dict:
         return self._c._post("/v1/sandboxes", {
             "template_id": template_id, "image": image, "rom_id": rom_id,
             "vcpu": vcpu, "mem_gib": mem_gib, "ttl_seconds": ttl_seconds,
@@ -76,6 +77,7 @@ class Sandboxes(_Resource):
             "network": {"egress": egress, "allow": allow or []},
             "env": env or {},
             "auto_suspend_idle_seconds": auto_suspend_idle_seconds,
+            "volumes": volumes or [],
         }, timeout=600)
 
     def get(self, sandbox_id: str) -> dict:
@@ -152,6 +154,18 @@ class Sandboxes(_Resource):
         raise TimeoutError(f"{sandbox_id} not {until} after {timeout}s")
 
 
+class Volumes(_Resource):
+    def create(self, name: str, size_gib: float = 10.0) -> dict:
+        """Idempotent by name within your org; safe to call on every start."""
+        return self._c._post("/v1/volumes", {"name": name, "size_gib": size_gib})
+
+    def list(self) -> list[dict]:
+        return self._c._get("/v1/volumes")
+
+    def delete(self, volume_id: str) -> dict:
+        return self._c._delete(f"/v1/volumes/{volume_id}")
+
+
 class Usage(_Resource):
     def query(self, *, label: str | None = None) -> dict:
         params = {"label": label} if label else {}
@@ -183,6 +197,7 @@ class Numinous:
         self.templates = Templates(self)
         self.roms = Roms(self)
         self.sandboxes = Sandboxes(self)
+        self.volumes = Volumes(self)
         self.usage = Usage(self)
         self.capacity = Capacity(self)
 
