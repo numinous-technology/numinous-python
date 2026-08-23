@@ -8,9 +8,10 @@ non-preemptible.
 ## Install
 
 ```bash
-pip install "numinous @ git+https://github.com/numinous-technology/numinous-python"
-# PyPI release coming with GA
+curl -fsSL https://cloud.numinous.technology/install.sh | sh
 ```
+
+Installs the `numinous` CLI + Python SDK (via pipx/uv/pip, whichever exists).
 
 ## Use
 
