@@ -67,13 +67,15 @@ class Sandboxes(_Resource):
                ttl_seconds: int = 0, launch_token: str | None = None,
                labels: dict[str, str] | None = None,
                egress: str = "allow", allow: list[str] | None = None,
-               env: dict[str, str] | None = None) -> dict:
+               env: dict[str, str] | None = None,
+               auto_suspend_idle_seconds: int = 0) -> dict:
         return self._c._post("/v1/sandboxes", {
             "template_id": template_id, "image": image, "rom_id": rom_id,
             "vcpu": vcpu, "mem_gib": mem_gib, "ttl_seconds": ttl_seconds,
             "launch_token": launch_token, "labels": labels or {},
             "network": {"egress": egress, "allow": allow or []},
             "env": env or {},
+            "auto_suspend_idle_seconds": auto_suspend_idle_seconds,
         }, timeout=600)
 
     def get(self, sandbox_id: str) -> dict:
@@ -127,6 +129,15 @@ class Sandboxes(_Resource):
                            params={"path": path})
         return base64.b64decode(out["content_b64"])
 
+    def checkpoint(self, sandbox_id: str, name: str | None = None) -> dict:
+        """Freeze a running sandbox into a new template (fork point)."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/checkpoint",
+                             {"name": name}, timeout=900)
+
+    def metrics(self, sandbox_id: str) -> dict:
+        """Observed cpu/mem samples while running."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/metrics")
+
     def events(self, sandbox_id: str) -> list[dict]:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}/events")
 
@@ -177,6 +188,9 @@ class Numinous:
 
     def pricing(self) -> dict:
         return self._get("/v1/pricing")
+
+    def whoami(self) -> dict:
+        return self._get("/v1/whoami")
 
     def healthz(self) -> dict:
         return self._get("/v1/healthz")

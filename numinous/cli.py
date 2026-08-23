@@ -37,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     boot.add_argument("--count", type=int, default=1)
     boot.add_argument("--label", action="append", default=[], help="k=v")
     boot.add_argument("--token", help="launch token (idempotency)")
+    boot.add_argument("--auto-suspend", type=int, default=0, metavar="SECONDS",
+                      help="suspend after N idle seconds; auto-wakes on exec")
 
     ex = sub.add_parser("exec", help="run a command in a sandbox")
     ex.add_argument("sandbox_id")
@@ -46,6 +48,13 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("suspend", "resume", "destroy"):
         c = sub.add_parser(name, help=f"{name} a sandbox")
         c.add_argument("sandbox_id")
+
+    ck = sub.add_parser("checkpoint", help="freeze a running sandbox into a template")
+    ck.add_argument("sandbox_id")
+    ck.add_argument("--name")
+
+    mt = sub.add_parser("metrics", help="observed cpu/mem samples")
+    mt.add_argument("sandbox_id")
 
     exp = sub.add_parser("export", help="export a path (works after death)")
     exp.add_argument("sandbox_id")
@@ -76,7 +85,8 @@ def main(argv: list[str] | None = None) -> int:
                 tok = f"{a.token}-{i}" if a.token and a.count > 1 else a.token
                 out.append(nc.sandboxes.create(
                     template_id=a.template_id, vcpu=a.vcpu, mem_gib=a.mem,
-                    ttl_seconds=a.ttl, labels=labels, launch_token=tok))
+                    ttl_seconds=a.ttl, labels=labels, launch_token=tok,
+                    auto_suspend_idle_seconds=a.auto_suspend))
             _out(out if a.count > 1 else out[0])
         elif a.cmd == "exec":
             r = nc.sandboxes.exec(a.sandbox_id, a.command, timeout_sec=a.timeout)
@@ -89,6 +99,10 @@ def main(argv: list[str] | None = None) -> int:
             _out(nc.sandboxes.resume(a.sandbox_id))
         elif a.cmd == "destroy":
             _out(nc.sandboxes.destroy(a.sandbox_id))
+        elif a.cmd == "checkpoint":
+            _out(nc.sandboxes.checkpoint(a.sandbox_id, name=a.name))
+        elif a.cmd == "metrics":
+            _out(nc.sandboxes.metrics(a.sandbox_id))
         elif a.cmd == "export":
             _out(nc.sandboxes.export(a.sandbox_id, a.path, to=a.to))
         elif a.cmd == "ls":
