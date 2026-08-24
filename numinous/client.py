@@ -161,7 +161,7 @@ class Volumes(_Resource):
 
         kind="sandbox": host-local NVMe, mounts on CPU sandboxes ($0.10/GiB-mo).
         kind="gpu": RunPod network volume, datacenter-scoped, mounts on GPU
-        sandboxes only ($0.09/GiB-mo). The two kinds live on different
+        sandboxes only ($0.10/GiB-mo). The two kinds live on different
         hardware and never cross.
         """
         body: dict = {"name": name, "size_gib": size_gib, "kind": kind}
@@ -229,6 +229,14 @@ class Numinous:
             detail = r.json().get("detail", {})
         except Exception:
             detail = {}
+        if isinstance(detail, list):
+            # FastAPI validation errors ship detail as a list
+            msg = "; ".join(
+                f"{'.'.join(str(p) for p in e.get('loc', []))}: {e.get('msg', '')}"
+                for e in detail if isinstance(e, dict)) or r.text[:300]
+            raise NuminousError("validation", msg, r.status_code)
+        if not isinstance(detail, dict):
+            detail = {"message": str(detail)[:300]}
         raise NuminousError(detail.get("cause", "unknown"),
                             detail.get("message", r.text[:300]), r.status_code)
 
