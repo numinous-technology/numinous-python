@@ -1,17 +1,9 @@
 [project]
 name = "numinous"
-version = "0.1.5"
-description = "SDK + CLI for Numinous Cloud: build & test environments with hard TTLs, typed failure causes, and per-second metering"
-readme = "README.md"
-license = { text = "Apache-2.0" }
-keywords = ["sandbox", "ci", "microvm", "agents", "harbor"]
+version = "0.1.7"
+description = "Python SDK for Numinous Cloud sandboxes"
 requires-python = ">=3.9"
 dependencies = ["httpx>=0.24"]
-
-[project.urls]
-Homepage = "https://cloud.numinous.technology"
-Documentation = "https://cloud.numinous.technology/docs"
-Source = "https://github.com/numinous-technology/numinous-python"
 
 [project.scripts]
 numinous = "numinous.cli:main"

@@ -39,11 +39,37 @@ def main(argv: list[str] | None = None) -> int:
     boot.add_argument("--token", help="launch token (idempotency)")
     boot.add_argument("--auto-suspend", type=int, default=0, metavar="SECONDS",
                       help="suspend after N idle seconds; auto-wakes on exec")
+    boot.add_argument("--gpu", type=str, default=None, metavar="TYPE",
+                      help="GPU type (e.g. H100); routes to the GPU plane")
+    boot.add_argument("--gpu-count", type=int, default=1)
+    boot.add_argument("--gpu-max-hr", type=float, default=None,
+                      help="per-GPU price ceiling in USD/hr")
 
     ex = sub.add_parser("exec", help="run a command in a sandbox")
     ex.add_argument("sandbox_id")
     ex.add_argument("command")
     ex.add_argument("--timeout", type=float, default=300)
+    ex.add_argument("--exclusive", action="store_true",
+                    help="GPU plane: take an exclusive, quiet GPU for a "
+                         "perf-timed section (evicts idle residents first)")
+
+    # GPU remoting, folded into this CLI (no separate ngpu binary): create a
+    # GPU sandbox on the multiplexed plane, run a command, pull artifacts, and
+    # tear down. Everything goes through the Numinous API, so no GPU-side code
+    # is ever shipped in this client.
+    gr = sub.add_parser("gpu", help="GPU plane helpers")
+    grs = gr.add_subparsers(dest="gcmd", required=True)
+    grun = grs.add_parser("run", help="run a command on a shared GPU")
+    grun.add_argument("command")
+    grun.add_argument("--gpu", type=str, default="H100", metavar="TYPE")
+    grun.add_argument("--image", default=None, help="base docker image")
+    grun.add_argument("--template", default=None, help="template id")
+    grun.add_argument("--exclusive", action="store_true")
+    grun.add_argument("--timeout", type=float, default=1800)
+    grun.add_argument("--pull", action="append", default=[], metavar="PATH",
+                      help="export this path after the run (repeatable)")
+    grun.add_argument("--keep", action="store_true",
+                      help="do not destroy the sandbox after the run")
 
     for name in ("suspend", "resume", "destroy"):
         c = sub.add_parser(name, help=f"{name} a sandbox")
@@ -92,13 +118,33 @@ def main(argv: list[str] | None = None) -> int:
                 out.append(nc.sandboxes.create(
                     template_id=a.template_id, vcpu=a.vcpu, mem_gib=a.mem,
                     ttl_seconds=a.ttl, labels=labels, launch_token=tok,
-                    auto_suspend_idle_seconds=a.auto_suspend))
+                    auto_suspend_idle_seconds=a.auto_suspend,
+                    gpu=(a.gpu_count if a.gpu else 0), gpu_type=a.gpu,
+                    gpu_max_hr=a.gpu_max_hr))
             _out(out if a.count > 1 else out[0])
         elif a.cmd == "exec":
-            r = nc.sandboxes.exec(a.sandbox_id, a.command, timeout_sec=a.timeout)
+            env = {"GPU_EXCLUSIVE": "1"} if a.exclusive else {}
+            r = nc.sandboxes.exec(a.sandbox_id, a.command, timeout_sec=a.timeout,
+                                  env=env)
             sys.stdout.write(r["stdout"])
             sys.stderr.write(r["stderr"])
             return r["exit_code"]
+        elif a.cmd == "gpu" and a.gcmd == "run":
+            sb = nc.sandboxes.create(
+                template_id=a.template, image=a.image, gpu=1, gpu_type=a.gpu)
+            sid = sb["id"]
+            try:
+                env = {"GPU_EXCLUSIVE": "1"} if a.exclusive else {}
+                r = nc.sandboxes.exec(sid, a.command, timeout_sec=a.timeout,
+                                      env=env)
+                sys.stdout.write(r.get("stdout", ""))
+                sys.stderr.write(r.get("stderr", ""))
+                for pth in a.pull:
+                    _out(nc.sandboxes.export(sid, pth))
+                return r["exit_code"]
+            finally:
+                if not a.keep:
+                    nc.sandboxes.destroy(sid)
         elif a.cmd == "suspend":
             _out(nc.sandboxes.suspend(a.sandbox_id))
         elif a.cmd == "resume":

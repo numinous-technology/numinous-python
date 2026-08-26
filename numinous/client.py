@@ -69,7 +69,13 @@ class Sandboxes(_Resource):
                egress: str = "allow", allow: list[str] | None = None,
                env: dict[str, str] | None = None,
                auto_suspend_idle_seconds: int = 0,
-               volumes: list[dict] | None = None) -> dict:
+               volumes: list[dict] | None = None,
+               gpu: int = 0, gpu_type: str | None = None,
+               gpu_max_hr: float | None = None,
+               plane: str = "auto") -> dict:
+        # gpu > 0 routes to the GPU plane on the server. Whether that plane is
+        # a dedicated pod or a shared, multiplexed card is the platform's
+        # decision; the client only states intent. No GPU-side code ships here.
         return self._c._post("/v1/sandboxes", {
             "template_id": template_id, "image": image, "rom_id": rom_id,
             "vcpu": vcpu, "mem_gib": mem_gib, "ttl_seconds": ttl_seconds,
@@ -78,6 +84,8 @@ class Sandboxes(_Resource):
             "env": env or {},
             "auto_suspend_idle_seconds": auto_suspend_idle_seconds,
             "volumes": volumes or [],
+            "gpu": gpu, "gpu_type": gpu_type, "gpu_max_hr": gpu_max_hr,
+            "plane": plane,
         }, timeout=600)
 
     def get(self, sandbox_id: str) -> dict:
@@ -135,6 +143,28 @@ class Sandboxes(_Resource):
         """Freeze a running sandbox into a new template (fork point)."""
         return self._c._post(f"/v1/sandboxes/{sandbox_id}/checkpoint",
                              {"name": name}, timeout=900)
+
+    def fork(self, sandbox_id: str, count: int = 1, *,
+             ttl_seconds: int | None = None,
+             labels: dict | None = None) -> dict:
+        """Fork a live sandbox into `count` children that start from its exact
+        state (copy-on-write memory on the firecracker plane, committed rootfs
+        on the docker plane). The parent keeps running. Returns
+        {parent, snapshot_ref, requested, created, children:[...]}."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/fork",
+                             {"count": count, "ttl_seconds": ttl_seconds,
+                              "labels": labels or {}}, timeout=900)
+
+    def fork(self, sandbox_id: str, count: int = 1, *,
+             ttl_seconds: int | None = None,
+             labels: dict | None = None) -> dict:
+        """Fork a live sandbox into `count` children that start from its exact
+        state (copy-on-write memory on the firecracker plane, committed rootfs
+        on the docker plane). The parent keeps running. Returns
+        {parent, snapshot_ref, requested, created, children:[...]}."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/fork",
+                             {"count": count, "ttl_seconds": ttl_seconds,
+                              "labels": labels or {}}, timeout=900)
 
     def metrics(self, sandbox_id: str) -> dict:
         """Observed cpu/mem samples while running."""
