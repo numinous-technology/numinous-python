@@ -64,6 +64,8 @@ class Roms(_Resource):
 class Sandboxes(_Resource):
     def create(self, *, template_id: str | None = None, image: str | None = None,
                rom_id: str | None = None, vcpu: int = 2, mem_gib: float = 4.0,
+               disk_gib: float | None = None, run_mode: str | None = None,
+               gpu_mode: str | None = None,
                ttl_seconds: int = 0, launch_token: str | None = None,
                labels: dict[str, str] | None = None,
                egress: str = "allow", allow: list[str] | None = None,
@@ -76,17 +78,26 @@ class Sandboxes(_Resource):
         # gpu > 0 routes to the GPU plane on the server. Whether that plane is
         # a dedicated pod or a shared, multiplexed card is the platform's
         # decision; the client only states intent. No GPU-side code ships here.
-        return self._c._post("/v1/sandboxes", {
+        body = {
             "template_id": template_id, "image": image, "rom_id": rom_id,
-            "vcpu": vcpu, "mem_gib": mem_gib, "ttl_seconds": ttl_seconds,
+            "vcpu": vcpu, "mem_gib": mem_gib, "disk_gib": disk_gib,
+            "run_mode": run_mode, "gpu_mode": gpu_mode,
+            "ttl_seconds": ttl_seconds,
             "launch_token": launch_token, "labels": labels or {},
             "network": {"egress": egress, "allow": allow or []},
             "env": env or {},
             "auto_suspend_idle_seconds": auto_suspend_idle_seconds,
             "volumes": volumes or [],
-            "gpu": gpu, "gpu_type": gpu_type, "gpu_max_hr": gpu_max_hr,
-            "plane": plane,
-        }, timeout=600)
+            "gpu": gpu, "plane": plane,
+        }
+        # Only send GPU fields when actually set. Sending an explicit null makes
+        # a typed server reject the whole request (422), which is how SDK 0.1.7
+        # broke every create; "absent" is what "use the default" must look like.
+        if gpu_type is not None:
+            body["gpu_type"] = gpu_type
+        if gpu_max_hr is not None:
+            body["gpu_max_hr"] = gpu_max_hr
+        return self._c._post("/v1/sandboxes", body, timeout=600)
 
     def get(self, sandbox_id: str) -> dict:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}")
@@ -155,16 +166,75 @@ class Sandboxes(_Resource):
                              {"count": count, "ttl_seconds": ttl_seconds,
                               "labels": labels or {}}, timeout=900)
 
-    def fork(self, sandbox_id: str, count: int = 1, *,
-             ttl_seconds: int | None = None,
-             labels: dict | None = None) -> dict:
-        """Fork a live sandbox into `count` children that start from its exact
-        state (copy-on-write memory on the firecracker plane, committed rootfs
-        on the docker plane). The parent keeps running. Returns
-        {parent, snapshot_ref, requested, created, children:[...]}."""
-        return self._c._post(f"/v1/sandboxes/{sandbox_id}/fork",
-                             {"count": count, "ttl_seconds": ttl_seconds,
-                              "labels": labels or {}}, timeout=900)
+    def snapshots(self, sandbox_id: str, limit: int = 500) -> list[dict]:
+        """The per-exec / per-tool-call snapshot timeline. Entries whose
+        `command` starts with `tool:` were taken by the host tailer at agent
+        tool-call boundaries; `kind=pre_exec` rows are state entering each
+        exec. Each entry is a replay/fork point."""
+        out = self._c._get(f"/v1/sandboxes/{sandbox_id}/snapshots",
+                           params={"limit": limit})
+        return out if isinstance(out, list) else out.get("items", [])
+
+    def tree(self, sandbox_id: str) -> dict:
+        """Fork lineage: ancestors and descendants of this sandbox."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/tree")
+
+    def set_egress(self, sandbox_id: str, egress: str,
+                   allow: list[str] | None = None) -> dict:
+        """Switch network policy on a RUNNING sandbox: allow | allowlist |
+        deny. Enforced server-side without a reboot."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/network",
+                             {"egress": egress, "allow": allow or []})
+
+    def exec_async_start(self, sandbox_id: str, command: str,
+                         timeout_sec: float = 3600, *,
+                         cwd: str | None = None,
+                         env: dict[str, str] | None = None,
+                         user: str | None = None) -> str:
+        """Start a detached exec and return its exec_id. The command runs in
+        the guest with streams on the guest's disk; it survives control-plane
+        deploys and client disconnects. Poll with exec_async_poll, or block
+        with exec_async_wait."""
+        out = self._c._post(f"/v1/sandboxes/{sandbox_id}/exec/async",
+                            {"command": command, "timeout_sec": timeout_sec,
+                             "cwd": cwd, "env": env or {}, "user": user},
+                            timeout=120)
+        return out["exec_id"]
+
+    def exec_async_poll(self, exec_id: str) -> dict:
+        """Non-blocking status: {status: running|done|error, exit_code,
+        stdout, stderr}."""
+        return self._c._get(f"/v1/execs/{exec_id}")
+
+    def exec_async_wait(self, exec_id: str, *, timeout: float = 3600,
+                        poll: float = 2.0) -> dict:
+        """Block until the detached exec reaches a terminal state. Transient
+        poll errors are retried: that is the point of the async path."""
+        deadline = time.monotonic() + timeout
+        errors = 0
+        while time.monotonic() < deadline:
+            try:
+                out = self.exec_async_poll(exec_id)
+                errors = 0
+            except Exception:
+                errors += 1
+                if errors >= 30:
+                    raise
+                time.sleep(poll)
+                continue
+            if out.get("status") in ("done", "error"):
+                return out
+            time.sleep(poll)
+        raise TimeoutError(f"exec {exec_id} still running after {timeout}s")
+
+    def execs(self, sandbox_id: str, limit: int = 500) -> dict:
+        """Unified exec timeline (sync + async + tool-call snapshots)."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/execs",
+                            params={"limit": limit})
+
+    def snapshot_stats(self, sandbox_id: str) -> dict:
+        """Replay header aggregates: counts, bytes, per-tool breakdown."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/snapshots/stats")
 
     def metrics(self, sandbox_id: str) -> dict:
         """Observed cpu/mem samples while running."""
@@ -182,6 +252,32 @@ class Sandboxes(_Resource):
                 return sb
             time.sleep(poll)
         raise TimeoutError(f"{sandbox_id} not {until} after {timeout}s")
+
+
+class Stats(_Resource):
+    def rollup(self, label: str) -> dict:
+        """Whole-trial rollup by label, e.g. 'harbor.session_id:trial-x'."""
+        return self._c._get("/v1/rollup", params={"label": label})
+
+    def concurrency(self, hours: int = 24, step_minutes: int = 5) -> dict:
+        """Concurrent running sandboxes over time (the scale graph)."""
+        return self._c._get("/v1/stats/concurrency",
+                            params={"hours": hours,
+                                    "step_minutes": step_minutes})
+
+
+class Batches(_Resource):
+    def submit(self, trials: list[dict], *, name: str = "",
+               labels: dict | None = None) -> dict:
+        """Submit trials as one batch. Each trial: {name, spec, depends_on}.
+        spec is a sandbox-create body; depends_on lists trial names that must
+        reach a terminal state first. Returns {id, state, trials}."""
+        return self._c._post("/v1/batches",
+                             {"name": name, "labels": labels or {},
+                              "trials": trials}, timeout=120)
+
+    def get(self, batch_id: str) -> dict:
+        return self._c._get(f"/v1/batches/{batch_id}")
 
 
 class Volumes(_Resource):
@@ -240,6 +336,8 @@ class Numinous:
         self.volumes = Volumes(self)
         self.usage = Usage(self)
         self.capacity = Capacity(self)
+        self.batches = Batches(self)
+        self.stats = Stats(self)
 
     def pricing(self) -> dict:
         return self._get("/v1/pricing")
