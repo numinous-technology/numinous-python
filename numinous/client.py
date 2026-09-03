@@ -15,11 +15,13 @@ class NuminousError(RuntimeError):
     auth, state, not_found.
     """
 
-    def __init__(self, cause: str, message: str, status: int):
+    def __init__(self, cause: str, message: str, status: int,
+                 retryable: bool | None = None):
         super().__init__(f"[{cause}] {message}")
         self.cause = cause
         self.message = message
         self.status = status
+        self._retryable = retryable  # server hint, when present
 
     @property
     def is_provider_fault(self) -> bool:
@@ -27,7 +29,11 @@ class NuminousError(RuntimeError):
 
     @property
     def retryable(self) -> bool:
-        # capacity clears (or use reservations); infra may clear; user_* will not.
+        # Prefer the server's own hint: an org_quota from a concurrency/rate cap
+        # frees on its own and is retryable; a hard budget cap is not. Fall back
+        # to cause for older servers (capacity/infra clear; user_* never do).
+        if self._retryable is not None:
+            return self._retryable
         return self.cause.startswith("provider_")
 
 
@@ -366,7 +372,8 @@ class Numinous:
         if not isinstance(detail, dict):
             detail = {"message": str(detail)[:300]}
         raise NuminousError(detail.get("cause", "unknown"),
-                            detail.get("message", r.text[:300]), r.status_code)
+                            detail.get("message", r.text[:300]), r.status_code,
+                            retryable=detail.get("retryable"))
 
     def _get(self, path: str, params: dict | None = None) -> Any:
         r = self._http.get(path, params=params)
