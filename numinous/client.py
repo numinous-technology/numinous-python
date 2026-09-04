@@ -81,15 +81,20 @@ class Sandboxes(_Resource):
                gpu: int = 0, gpu_type: str | None = None,
                gpu_max_hr: float | None = None,
                plane: str = "auto",
-               wait_for_slot: int | None = None) -> dict:
+               wait_for_slot: int | None = None,
+               retry_admission_sec: float = 0.0) -> dict:
         """Create a sandbox.
 
-        wait_for_slot: admission queue. Hold the create for up to N seconds
-        while the org is over a self-freeing cap (concurrency, vCPU, memory,
-        GPUs, start rate) and admit it when a slot frees, instead of raising
-        NuminousError(org_quota, retryable=True) at once. Bounded by the org's
-        admission_wait_sec setting (default 0 = queueing off, so this is a
-        no-op until the org enables it). Budget caps never wait.
+        wait_for_slot: SERVER-side admission queue. Hold the create for up to
+        N seconds while the org is over a self-freeing cap (concurrency, vCPU,
+        memory, GPUs, start rate) and admit it when a slot frees, instead of
+        raising NuminousError(org_quota, retryable=True) at once. Bounded by
+        the org's admission_wait_sec setting (default 0 = queueing off, so
+        this is a no-op until the org enables it). Budget caps never wait.
+
+        retry_admission_sec: CLIENT-side backoff. Retry retryable admission
+        refusals (429 org_quota retryable, 503 provider_capacity) with
+        exponential backoff for up to this many seconds. 0 = raise at once.
         """
         # gpu > 0 routes to the GPU plane on the server. Whether that plane is
         # a dedicated pod or a shared, multiplexed card is the platform's
@@ -117,18 +122,66 @@ class Sandboxes(_Resource):
         if wait_for_slot is not None:
             body["wait_for_slot_sec"] = int(wait_for_slot)
             timeout += int(wait_for_slot)
-        return self._c._post("/v1/sandboxes", body, timeout=timeout)
+        deadline = time.monotonic() + max(0.0, retry_admission_sec)
+        delay = 2.0
+        while True:
+            try:
+                return self._c._post("/v1/sandboxes", body, timeout=timeout)
+            except NuminousError as e:
+                admission = (e.status == 429 and e.cause == "org_quota") or (
+                    e.status == 503 and e.cause == "provider_capacity")
+                left = deadline - time.monotonic()
+                if not (admission and e.retryable) or left <= 0:
+                    raise
+                time.sleep(min(delay, left))
+                delay = min(delay * 1.7, 30.0)
 
     def get(self, sandbox_id: str) -> dict:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}")
 
-    def list(self, *, label: str | None = None, state: str | None = None) -> list[dict]:
-        params = {}
+    def set_labels(self, sandbox_id: str, labels: dict[str, str | None]) -> dict:
+        """Merge labels onto a sandbox in any state (null deletes a key).
+        Harnesses learn the experiment, agent, and reward after create; the
+        console groups and grades by these labels."""
+        return self._c._patch(f"/v1/sandboxes/{sandbox_id}/labels", {"labels": labels})
+
+    def list(self, *, label: str | None = None, state: str | None = None,
+             limit: int | None = None, offset: int = 0) -> list[dict]:
+        """Sandboxes visible to this key (the org's). Unpaged by default for
+        compatibility; pass limit (<= 200) to page, or use list_all()."""
+        params: dict[str, Any] = {}
+        if label:
+            params["label"] = label
+        if state:
+            params["state"] = state
+        if limit is not None:
+            params["limit"] = limit
+            params["offset"] = offset
+        out = self._c._get("/v1/sandboxes", params=params)
+        return out if isinstance(out, list) else out.get("items", [])
+
+    def list_page(self, *, label: str | None = None, state: str | None = None,
+                  limit: int = 200, offset: int = 0) -> dict:
+        """One page: {items, total, limit, offset}."""
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
         if label:
             params["label"] = label
         if state:
             params["state"] = state
         return self._c._get("/v1/sandboxes", params=params)
+
+    def list_all(self, *, label: str | None = None, state: str | None = None,
+                 page: int = 200, max_pages: int = 100) -> list[dict]:
+        """Every matching sandbox, walking pages of `page` until `total`."""
+        out: list[dict] = []
+        off = 0
+        for _ in range(max_pages):
+            pg = self.list_page(label=label, state=state, limit=page, offset=off)
+            out += pg.get("items", [])
+            off += page
+            if off >= int(pg.get("total", 0)):
+                break
+        return out
 
     def exec(self, sandbox_id: str, command: str, timeout_sec: float = 300,
              *, cwd: str | None = None, env: dict[str, str] | None = None,
@@ -186,13 +239,19 @@ class Sandboxes(_Resource):
                              {"count": count, "ttl_seconds": ttl_seconds,
                               "labels": labels or {}}, timeout=900)
 
-    def snapshots(self, sandbox_id: str, limit: int = 500) -> list[dict]:
+    def snapshots(self, sandbox_id: str, limit: int = 500, *,
+                  verify: bool = False) -> list[dict]:
         """The per-exec / per-tool-call snapshot timeline. Entries whose
         `command` starts with `tool:` were taken by the host tailer at agent
         tool-call boundaries; `kind=pre_exec` rows are state entering each
-        exec. Each entry is a replay/fork point."""
-        out = self._c._get(f"/v1/sandboxes/{sandbox_id}/snapshots",
-                           params={"limit": limit})
+        exec. Each entry is a replay/fork point.
+
+        verify=True asks the control plane to HEAD each durable_ref in object
+        storage and adds `durable_verified` (True/False/None) per entry."""
+        params: dict[str, Any] = {"limit": limit}
+        if verify:
+            params["verify"] = 1
+        out = self._c._get(f"/v1/sandboxes/{sandbox_id}/snapshots", params=params)
         return out if isinstance(out, list) else out.get("items", [])
 
     def tree(self, sandbox_id: str) -> dict:
@@ -275,6 +334,10 @@ class Sandboxes(_Resource):
 
 
 class Stats(_Resource):
+    def checkpoints(self, days: int = 7) -> dict:
+        """Checkpoints-per-trial distribution for this org over `days`."""
+        return self._c._get("/v1/stats/checkpoints", params={"days": days})
+
     def rollup(self, label: str) -> dict:
         """Whole-trial rollup by label, e.g. 'harbor.session_id:trial-x'."""
         return self._c._get("/v1/rollup", params={"label": label})
@@ -323,9 +386,31 @@ class Volumes(_Resource):
 
 
 class Usage(_Resource):
-    def query(self, *, label: str | None = None) -> dict:
-        params = {"label": label} if label else {}
+    def query(self, *, label: str | None = None, since: str | None = None,
+              sandbox_id: str | None = None) -> dict:
+        """Billed spans for this org: {spans, total_cost_usd,
+        unbilled_provider_fault_usd}. `since` is ISO-8601."""
+        params: dict[str, Any] = {}
+        if label:
+            params["label"] = label
+        if since:
+            params["since"] = since
+        if sandbox_id:
+            params["sandbox_id"] = sandbox_id
         return self._c._get("/v1/usage", params=params)
+
+
+class Limits(_Resource):
+    def get(self) -> dict:
+        """This org's caps and live usage against them."""
+        return self._c._get("/v1/limits")
+
+    def set(self, **caps: Any) -> dict:
+        """Tighten or raise your own caps (0 = unlimited within the platform
+        ceiling). Keys: max_concurrent, max_vcpu, max_mem_gib, max_gpus,
+        daily_budget_usd, monthly_budget_usd, max_starts_per_hour,
+        max_starts_per_day, budget_mode ('hard'|'warn'), admission_wait_sec."""
+        return self._c._put("/v1/limits", caps, timeout=60)
 
 
 class Capacity(_Resource):
@@ -355,6 +440,7 @@ class Numinous:
         self.sandboxes = Sandboxes(self)
         self.volumes = Volumes(self)
         self.usage = Usage(self)
+        self.limits = Limits(self)
         self.capacity = Capacity(self)
         self.batches = Batches(self)
         self.stats = Stats(self)
@@ -401,6 +487,11 @@ class Numinous:
 
     def _put(self, path: str, body: dict, timeout: float = 600) -> Any:
         r = self._http.put(path, json=body, timeout=timeout)
+        self._raise_for(r)
+        return r.json()
+
+    def _patch(self, path: str, body: dict, timeout: float = 60) -> Any:
+        r = self._http.patch(path, json=body, timeout=timeout)
         self._raise_for(r)
         return r.json()
 
