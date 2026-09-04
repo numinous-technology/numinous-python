@@ -80,7 +80,17 @@ class Sandboxes(_Resource):
                volumes: list[dict] | None = None,
                gpu: int = 0, gpu_type: str | None = None,
                gpu_max_hr: float | None = None,
-               plane: str = "auto") -> dict:
+               plane: str = "auto",
+               wait_for_slot: int | None = None) -> dict:
+        """Create a sandbox.
+
+        wait_for_slot: admission queue. Hold the create for up to N seconds
+        while the org is over a self-freeing cap (concurrency, vCPU, memory,
+        GPUs, start rate) and admit it when a slot frees, instead of raising
+        NuminousError(org_quota, retryable=True) at once. Bounded by the org's
+        admission_wait_sec setting (default 0 = queueing off, so this is a
+        no-op until the org enables it). Budget caps never wait.
+        """
         # gpu > 0 routes to the GPU plane on the server. Whether that plane is
         # a dedicated pod or a shared, multiplexed card is the platform's
         # decision; the client only states intent. No GPU-side code ships here.
@@ -103,7 +113,11 @@ class Sandboxes(_Resource):
             body["gpu_type"] = gpu_type
         if gpu_max_hr is not None:
             body["gpu_max_hr"] = gpu_max_hr
-        return self._c._post("/v1/sandboxes", body, timeout=600)
+        timeout = 600
+        if wait_for_slot is not None:
+            body["wait_for_slot_sec"] = int(wait_for_slot)
+            timeout += int(wait_for_slot)
+        return self._c._post("/v1/sandboxes", body, timeout=timeout)
 
     def get(self, sandbox_id: str) -> dict:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}")
