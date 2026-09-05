@@ -47,8 +47,8 @@ class Attribution:
     def __init__(self, *, run: str | None = None, run_name: str | None = None, trial: str | None = None,
                  task: str | None = None, agent: str | None = None, model: str | None = None,
                  source: str | None = None, source_ref: str | None = None, session: str | None = None,
-                 extra: dict[str, str] | None = None):
-        self.fields = {k: v for k, v in dict(run=run, run_name=run_name, trial=trial, task=task, agent=agent, model=model,
+                 attempt: int | None = None, extra: dict[str, str] | None = None):
+        self.fields = {k: v for k, v in dict(run=run, run_name=run_name, trial=trial, attempt=attempt, task=task, agent=agent, model=model,
                                               source=source, source_ref=source_ref, session=session).items() if v}
         self.extra = dict(extra or {})
 
@@ -164,12 +164,15 @@ class Sandboxes(_Resource):
         return self._c._get(f"/v1/sandboxes/{sandbox_id}")
 
     def set_outcome(self, sandbox_id: str, value: float | None, *, kind: str = "reward",
-                    status: str | None = None) -> dict:
-        """Record the harness's verdict on a finished (or running) sandbox:
-        numinous.outcome / outcome_kind / status. Displayed as a fact per
-        trial; the platform does no analytics on it."""
+                    label: str | None = None, status: str | None = None) -> dict:
+        """Record the harness's verdict on this attempt: numinous.outcome (a
+        number) and/or outcome_label (a category), outcome_kind, status. The
+        trial shows the latest attempt's verdict until trials.settle() is
+        called; the platform does no analytics on it."""
         labels: dict[str, str | None] = {"numinous.outcome": None if value is None else str(value),
                                          "numinous.outcome_kind": kind}
+        if label is not None:
+            labels["numinous.outcome_label"] = label
         if status is not None:
             labels["numinous.status"] = status
         return self.set_labels(sandbox_id, labels)
@@ -441,10 +444,13 @@ class AttributionConfig(_Resource):
         coverage over `days` (what share of sandboxes carry run/trial/outcome)."""
         return self._c._get("/v1/attribution", params={"days": days})
 
-    def set(self, *, aliases: dict[str, str] | None = None, sources: list[dict] | None = None) -> dict:
-        """aliases: foreign label key -> numinous.<field>. sources: [{match, url, name}]
+    def set(self, *, presets: list[str] | None = None, aliases: dict[str, str] | None = None, sources: list[dict] | None = None) -> dict:
+        """presets: integrations to enable (see get()["presets"]["available"]).
+        aliases: foreign label key -> numinous.<field>. sources: [{match, url, name}]
         where match is a regex on numinous.source_ref and url may use {run} {trial} {ref} {1}.."""
         body: dict[str, Any] = {}
+        if presets is not None:
+            body["presets"] = list(presets)
         if aliases is not None:
             body["aliases"] = aliases
         if sources is not None:
@@ -452,8 +458,57 @@ class AttributionConfig(_Resource):
         return self._c._put("/v1/attribution", body, timeout=60)
 
     def backfill(self, days: int = 3650) -> dict:
-        """Normalize labels on existing sandboxes (adds canonical keys, removes nothing)."""
+        """Re-run ingest over history: normalize labels (adds canonical keys,
+        removes nothing) and rebuild this org's trials and runs."""
         return self._c._post(f"/v1/attribution/backfill?days={int(days)}", {}, timeout=600)
+
+
+class Trials(_Resource):
+    """Trials: one harness unit of work with every retry attempt, materialized
+    by the platform from attribution labels."""
+
+    def list(self, *, run: str | None = None, agent: str | None = None, task: str | None = None,
+             filters: dict[str, str] | None = None, state: str | None = None, cause: str | None = None,
+             q: str | None = None, days: int = 30, limit: int = 50, offset: int = 0, sort: str = "started") -> dict:
+        params: dict[str, Any] = {"days": days, "limit": limit, "offset": offset, "sort": sort}
+        if run: params["experiment"] = run
+        if agent: params["agent"] = agent
+        if task: params["task"] = task
+        if state: params["state"] = state
+        if cause: params["cause"] = cause
+        if q: params["q"] = q
+        if filters:
+            params["filter"] = [f"{k}:{v}" for k, v in filters.items()]
+        return self._c._get("/v1/trials", params=params)
+
+    def list_all(self, **kw) -> list[dict]:
+        out: list[dict] = []
+        offset = 0
+        while True:
+            page = self.list(offset=offset, limit=200, **kw)
+            out.extend(page["items"])
+            offset += len(page["items"])
+            if not page["items"] or offset >= page["total"]:
+                return out
+
+    def get(self, trial: str) -> dict:
+        """The trial with `attempt_list`: every sandbox, in attempt order."""
+        return self._c._get(f"/v1/trials/{trial}/attempts")
+
+    def settle(self, trial: str, value: float | None = None, *, label: str | None = None,
+               kind: str = "reward", status: str | None = None, force: bool = False) -> dict:
+        """Settle the trial's final verdict. Attempt-level outcomes set with
+        sandboxes.set_outcome() are provisional; this one is final."""
+        return self._c._put(f"/v1/trials/{trial}/outcome", {"value": value, "label": label, "kind": kind, "status": status, "force": force})
+
+
+class Runs(_Resource):
+    def list(self, *, agent: str | None = None, task: str | None = None, source: str | None = None, q: str | None = None,
+             days: int = 30, limit: int = 30, offset: int = 0) -> dict:
+        params: dict[str, Any] = {"days": days, "limit": limit, "offset": offset}
+        for k, v in (("agent", agent), ("task", task), ("source", source), ("q", q)):
+            if v: params[k] = v
+        return self._c._get("/v1/runs", params=params)
 
 
 class Limits(_Resource):
@@ -498,6 +553,8 @@ class Numinous:
         self.usage = Usage(self)
         self.limits = Limits(self)
         self.attribution = AttributionConfig(self)
+        self.trials = Trials(self)
+        self.runs = Runs(self)
         self.capacity = Capacity(self)
         self.batches = Batches(self)
         self.stats = Stats(self)

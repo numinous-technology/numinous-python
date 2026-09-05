@@ -14,4 +14,4 @@
 from .client import Attribution, Numinous, NuminousError
 
 __all__ = ["Attribution", "Numinous", "NuminousError"]
-__version__ = "0.1.13"
+__version__ = "0.1.14"
