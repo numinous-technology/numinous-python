@@ -37,6 +37,25 @@ class NuminousError(RuntimeError):
         return self.cause.startswith("provider_")
 
 
+class Attribution:
+    """Who ran what, and why: the platform's vocabulary for grouping work.
+    Every field becomes a `numinous.<field>` label at create. Any harness can
+    fill it (a run is an experiment / campaign / sweep; a trial is one unit of
+    work whose retries share the id; source names the system that created it).
+    Verdicts are added later with sandboxes.set_outcome()."""
+
+    def __init__(self, *, run: str | None = None, run_name: str | None = None, trial: str | None = None,
+                 task: str | None = None, agent: str | None = None, model: str | None = None,
+                 source: str | None = None, source_ref: str | None = None, session: str | None = None,
+                 extra: dict[str, str] | None = None):
+        self.fields = {k: v for k, v in dict(run=run, run_name=run_name, trial=trial, task=task, agent=agent, model=model,
+                                              source=source, source_ref=source_ref, session=session).items() if v}
+        self.extra = dict(extra or {})
+
+    def labels(self) -> dict[str, str]:
+        return {**self.extra, **{f"numinous.{k}": str(v) for k, v in self.fields.items()}}
+
+
 class _Resource:
     def __init__(self, c: "Numinous"):
         self._c = c
@@ -82,8 +101,13 @@ class Sandboxes(_Resource):
                gpu_max_hr: float | None = None,
                plane: str = "auto",
                wait_for_slot: int | None = None,
-               retry_admission_sec: float = 0.0) -> dict:
+               retry_admission_sec: float = 0.0,
+               attribution: Attribution | None = None) -> dict:
         """Create a sandbox.
+
+        attribution: Attribution(run=, trial=, task=, agent=, ...) becomes
+        `numinous.*` labels so the console groups this sandbox into its trial
+        and run and links back to its source. Merged over `labels`.
 
         wait_for_slot: SERVER-side admission queue. Hold the create for up to
         N seconds while the org is over a self-freeing cap (concurrency, vCPU,
@@ -104,7 +128,7 @@ class Sandboxes(_Resource):
             "vcpu": vcpu, "mem_gib": mem_gib, "disk_gib": disk_gib,
             "run_mode": run_mode, "gpu_mode": gpu_mode,
             "ttl_seconds": ttl_seconds,
-            "launch_token": launch_token, "labels": labels or {},
+            "launch_token": launch_token, "labels": {**(labels or {}), **(attribution.labels() if attribution else {})},
             "network": {"egress": egress, "allow": allow or []},
             "env": env or {},
             "auto_suspend_idle_seconds": auto_suspend_idle_seconds,
@@ -138,6 +162,17 @@ class Sandboxes(_Resource):
 
     def get(self, sandbox_id: str) -> dict:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}")
+
+    def set_outcome(self, sandbox_id: str, value: float | None, *, kind: str = "reward",
+                    status: str | None = None) -> dict:
+        """Record the harness's verdict on a finished (or running) sandbox:
+        numinous.outcome / outcome_kind / status. Displayed as a fact per
+        trial; the platform does no analytics on it."""
+        labels: dict[str, str | None] = {"numinous.outcome": None if value is None else str(value),
+                                         "numinous.outcome_kind": kind}
+        if status is not None:
+            labels["numinous.status"] = status
+        return self.set_labels(sandbox_id, labels)
 
     def set_labels(self, sandbox_id: str, labels: dict[str, str | None]) -> dict:
         """Merge labels onto a sandbox in any state (null deletes a key).
@@ -400,6 +435,27 @@ class Usage(_Resource):
         return self._c._get("/v1/usage", params=params)
 
 
+class AttributionConfig(_Resource):
+    def get(self, days: int = 7) -> dict:
+        """Schema, this org's aliases and link templates, and attribution
+        coverage over `days` (what share of sandboxes carry run/trial/outcome)."""
+        return self._c._get("/v1/attribution", params={"days": days})
+
+    def set(self, *, aliases: dict[str, str] | None = None, sources: list[dict] | None = None) -> dict:
+        """aliases: foreign label key -> numinous.<field>. sources: [{match, url, name}]
+        where match is a regex on numinous.source_ref and url may use {run} {trial} {ref} {1}.."""
+        body: dict[str, Any] = {}
+        if aliases is not None:
+            body["aliases"] = aliases
+        if sources is not None:
+            body["sources"] = sources
+        return self._c._put("/v1/attribution", body, timeout=60)
+
+    def backfill(self, days: int = 3650) -> dict:
+        """Normalize labels on existing sandboxes (adds canonical keys, removes nothing)."""
+        return self._c._post(f"/v1/attribution/backfill?days={int(days)}", {}, timeout=600)
+
+
 class Limits(_Resource):
     def get(self) -> dict:
         """This org's caps and live usage against them."""
@@ -441,6 +497,7 @@ class Numinous:
         self.volumes = Volumes(self)
         self.usage = Usage(self)
         self.limits = Limits(self)
+        self.attribution = AttributionConfig(self)
         self.capacity = Capacity(self)
         self.batches = Batches(self)
         self.stats = Stats(self)

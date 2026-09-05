@@ -11,7 +11,7 @@
 >>> nc.sandboxes.destroy(sb["id"])
 """
 
-from .client import Numinous, NuminousError
+from .client import Attribution, Numinous, NuminousError
 
-__all__ = ["Numinous", "NuminousError"]
-__version__ = "0.1.0"
+__all__ = ["Attribution", "Numinous", "NuminousError"]
+__version__ = "0.1.13"
