@@ -39,11 +39,20 @@ def main(argv: list[str] | None = None) -> int:
     boot.add_argument("--token", help="launch token (idempotency)")
     boot.add_argument("--auto-suspend", type=int, default=0, metavar="SECONDS",
                       help="suspend after N idle seconds; auto-wakes on exec")
+    boot.add_argument("--inference-sleep", action="store_true",
+                      help="opt in to the firecracker inference-sleep monitor")
     boot.add_argument("--gpu", type=str, default=None, metavar="TYPE",
                       help="GPU type (e.g. H100); routes to the GPU plane")
     boot.add_argument("--gpu-count", type=int, default=1)
     boot.add_argument("--gpu-max-hr", type=float, default=None,
                       help="per-GPU price ceiling in USD/hr")
+    boot.add_argument("--snapshot-policy", default=None,
+                      choices=["auto", "continuous", "per_tool", "per_exec", "manual", "off"],
+                      help="replay points: auto (continuous on microVMs), per_exec, manual, off")
+    boot.add_argument("--snapshot-retention", type=int, default=None,
+                      help="keep the newest N replay points live")
+    boot.add_argument("--volume", action="append", default=[], metavar="VOL_ID:/mount/path",
+                      help="attach a persistent volume (repeatable)")
 
     ex = sub.add_parser("exec", help="run a command in a sandbox")
     ex.add_argument("sandbox_id")
@@ -79,13 +88,46 @@ def main(argv: list[str] | None = None) -> int:
     ck.add_argument("sandbox_id")
     ck.add_argument("--name")
 
+    sp = sub.add_parser("snapshot", help="take a replay point (memory + filesystem) now")
+    sp.add_argument("sandbox_id")
+    sp.add_argument("--label")
+
     mt = sub.add_parser("metrics", help="observed cpu/mem samples")
     mt.add_argument("sandbox_id")
+    mt.add_argument("--limit", type=int, default=2000)
+    mt.add_argument("--before", type=int, help="window.next_before from the preceding page")
+    mt.add_argument("--until", help="ISO-8601 timestamp with timezone")
+
+    st = sub.add_parser("steps", help="machine-observed steps of a sandbox (or a trial with --trial)")
+    st.add_argument("id")
+    st.add_argument("--trial", action="store_true", help="treat id as a trial key")
+    st.add_argument("--full", action="store_true", help="include the bounded per-step record")
+    st.add_argument("--series", help="comma-separated series names instead of rows (sandboxes only)")
+
+    nw = sub.add_parser("network", help="what a sandbox (or trial with --trial) reached and what stopped it")
+    nw.add_argument("id")
+    nw.add_argument("--trial", action="store_true")
+
+    eo = sub.add_parser("exec-output", help="full stdout or stderr of an exec whose response was truncated")
+    eo.add_argument("sandbox_id")
+    eo.add_argument("exec_id")
+    eo.add_argument("--stream", choices=("stdout", "stderr"), default="stdout")
+    eo.add_argument("-o", "--output", help="write to a file instead of stdout")
 
     exp = sub.add_parser("export", help="export a path (works after death)")
     exp.add_argument("sandbox_id")
     exp.add_argument("path")
     exp.add_argument("--to", help="s3://bucket/prefix")
+    exp.add_argument("--request-token", help="reuse after a lost response to avoid a duplicate export")
+    exp.add_argument("--output", help="download the published tar to a new local file")
+
+    artifact = sub.add_parser('artifact', help='retrieve retained exports')
+    artifact_sub = artifact.add_subparsers(dest='acmd', required=True)
+    artifact_get = artifact_sub.add_parser('get')
+    artifact_get.add_argument('export_id')
+    artifact_download = artifact_sub.add_parser('download')
+    artifact_download.add_argument('export_id')
+    artifact_download.add_argument('destination')
 
     ls = sub.add_parser("ls", help="list sandboxes")
     ls.add_argument("--label")
@@ -104,8 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("pricing", help="current rates")
 
     a = p.parse_args(argv)
-    nc = Numinous()
     try:
+        nc = Numinous()
         if a.cmd == "template" and a.tcmd == "pack":
             _out(nc.templates.pack(a.name, image=a.image, warm_cmd=a.warm))
         elif a.cmd == "template" and a.tcmd == "list":
@@ -119,8 +161,11 @@ def main(argv: list[str] | None = None) -> int:
                     template_id=a.template_id, vcpu=a.vcpu, mem_gib=a.mem,
                     ttl_seconds=a.ttl, labels=labels, launch_token=tok,
                     auto_suspend_idle_seconds=a.auto_suspend,
+                    inference_sleep=a.inference_sleep,
                     gpu=(a.gpu_count if a.gpu else 0), gpu_type=a.gpu,
-                    gpu_max_hr=a.gpu_max_hr))
+                    gpu_max_hr=a.gpu_max_hr,
+                    snapshot_policy=a.snapshot_policy, snapshot_retention=a.snapshot_retention,
+                    volumes=[{"volume_id": v.split(":", 1)[0], "mount_path": v.split(":", 1)[1]} for v in a.volume] or None))
             _out(out if a.count > 1 else out[0])
         elif a.cmd == "exec":
             env = {"GPU_EXCLUSIVE": "1"} if a.exclusive else {}
@@ -153,10 +198,36 @@ def main(argv: list[str] | None = None) -> int:
             _out(nc.sandboxes.destroy(a.sandbox_id))
         elif a.cmd == "checkpoint":
             _out(nc.sandboxes.checkpoint(a.sandbox_id, name=a.name))
+        elif a.cmd == "snapshot":
+            _out(nc.sandboxes.snapshot(a.sandbox_id, label=a.label))
         elif a.cmd == "metrics":
-            _out(nc.sandboxes.metrics(a.sandbox_id))
+            _out(nc.sandboxes.metrics(a.sandbox_id, limit=a.limit, before=a.before, until=a.until))
+        elif a.cmd == "steps":
+            if a.trial:
+                _out(nc.trials.steps(a.id, full=a.full))
+            elif a.series:
+                _out(nc.sandboxes.steps_series(a.id, [f.strip() for f in a.series.split(",")]))
+            else:
+                _out(nc.sandboxes.steps(a.id, full=a.full))
+        elif a.cmd == "network":
+            _out(nc.trials.network(a.id) if a.trial else nc.sandboxes.network(a.id))
+        elif a.cmd == "exec-output":
+            data = nc.sandboxes.exec_output(a.sandbox_id, a.exec_id, stream=a.stream)
+            if a.output:
+                with open(a.output, "wb") as f:
+                    f.write(data)
+                _out({"written": a.output, "bytes": len(data)})
+            else:
+                sys.stdout.buffer.write(data)
         elif a.cmd == "export":
-            _out(nc.sandboxes.export(a.sandbox_id, a.path, to=a.to))
+            result = nc.sandboxes.export(a.sandbox_id, a.path, to=a.to, request_token=a.request_token)
+            if a.output:
+                result = nc.exports.download(result['export_id'], a.output)
+            _out(result)
+        elif a.cmd == 'artifact' and a.acmd == 'get':
+            _out(nc.exports.get(a.export_id))
+        elif a.cmd == 'artifact' and a.acmd == 'download':
+            _out(nc.exports.download(a.export_id, a.destination))
         elif a.cmd == "ls":
             _out(nc.sandboxes.list(label=a.label, state=a.state))
         elif a.cmd == "usage":
@@ -176,6 +247,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error [{e.cause}]: {e.message}", file=sys.stderr)
         # provider faults are retryable and unbilled; exit codes reflect class
         return 75 if e.is_provider_fault else 1
+    except (OSError, ValueError) as e:
+        print(f'error: {e}', file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

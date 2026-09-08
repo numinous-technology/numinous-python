@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import os
+import hashlib
+from pathlib import Path
+import re
 import time
 from typing import Any, Optional
 
 import httpx
+
+from ._build_context import pack_context
 
 
 class NuminousError(RuntimeError):
@@ -65,20 +70,55 @@ class Templates(_Resource):
     def pack(self, name: str, *, image: str | None = None,
              dockerfile: str | None = None, context: str | None = None,
              warm_cmd: str | None = None) -> dict:
+        """Build from an image or inline Dockerfile and optional local context.
+
+        An omitted context is empty. An explicit context is uploaded from the
+        client, with bounded sizes and .dockerignore filtering. Symlinks,
+        special files and unsupported ignore syntax fail before HTTP.
+        """
+        if bool(image) == bool(dockerfile) or (context is not None and (image or not context)):
+            raise ValueError("Choose exactly one image or Dockerfile; context requires a Dockerfile")
         source: dict[str, Any] = {}
         if image:
             source = {"type": "image", "image": image, "warm_cmd": warm_cmd}
         elif dockerfile:
             source = {"type": "dockerfile", "dockerfile": dockerfile,
-                      "context": context or ".", "warm_cmd": warm_cmd}
+                      "warm_cmd": warm_cmd}
+            if context is not None:
+                source["context_tar_b64"] = pack_context(context)
         return self._c._post("/v1/templates", {"name": name, "source": source},
                              timeout=1800)
 
     def list(self) -> list[dict]:
         return self._c._get("/v1/templates")
 
+    def manifest(self, template_id: str) -> dict:
+        """What the template contains, recorded at build (OS release, package
+        inventories, file tree digest, binaries)."""
+        return self._c._get(f"/v1/templates/{template_id}/manifest")
+
+    def manifest_diff(self, template_id: str, against: str) -> dict:
+        """Drift between two builds: packages added, removed, changed; tree digest; binaries."""
+        return self._c._get(f"/v1/templates/{template_id}/manifest/diff", params={"against": against})
+
     def get(self, template_id: str) -> dict:
         return self._c._get(f"/v1/templates/{template_id}")
+
+
+class Snapshots(_Resource):
+    def file(self, snapshot_id: str, path: str, *, max_bytes: int = 16 << 20) -> dict:
+        """A file exactly as it was at the checkpoint, read from the
+        checkpoint's root disk without booting it. `content_b64` holds the
+        bytes; `kind` is regular, directory or symlink."""
+        return self._c._get(f"/v1/snapshots/{snapshot_id}/files", params={"path": path, "max_bytes": max_bytes})
+
+    def read(self, snapshot_id: str, path: str, *, max_bytes: int = 16 << 20) -> bytes:
+        import base64
+        out = self.file(snapshot_id, path, max_bytes=max_bytes)
+        return base64.b64decode(out["content_b64"]) if out.get("content_b64") else b""
+
+    def listdir(self, snapshot_id: str, path: str = "/") -> list[dict]:
+        return self._c._get(f"/v1/snapshots/{snapshot_id}/files", params={"path": path, "list": 1})["entries"]
 
 
 class Roms(_Resource):
@@ -96,7 +136,10 @@ class Sandboxes(_Resource):
                egress: str = "allow", allow: list[str] | None = None,
                env: dict[str, str] | None = None,
                auto_suspend_idle_seconds: int = 0,
+               inference_sleep: bool = False,
                volumes: list[dict] | None = None,
+               snapshot_policy: str | None = None,
+               snapshot_retention: int | None = None,
                gpu: int = 0, gpu_type: str | None = None,
                gpu_max_hr: float | None = None,
                plane: str = "auto",
@@ -108,6 +151,9 @@ class Sandboxes(_Resource):
         attribution: Attribution(run=, trial=, task=, agent=, ...) becomes
         `numinous.*` labels so the console groups this sandbox into its trial
         and run and links back to its source. Merged over `labels`.
+
+        inference_sleep: opt in to the firecracker inference-sleep monitor.
+        Runtime options belong in request fields, not reserved labels.
 
         wait_for_slot: SERVER-side admission queue. Hold the create for up to
         N seconds while the org is over a self-freeing cap (concurrency, vCPU,
@@ -132,6 +178,7 @@ class Sandboxes(_Resource):
             "network": {"egress": egress, "allow": allow or []},
             "env": env or {},
             "auto_suspend_idle_seconds": auto_suspend_idle_seconds,
+            "inference_sleep": inference_sleep,
             "volumes": volumes or [],
             "gpu": gpu, "plane": plane,
         }
@@ -142,6 +189,14 @@ class Sandboxes(_Resource):
             body["gpu_type"] = gpu_type
         if gpu_max_hr is not None:
             body["gpu_max_hr"] = gpu_max_hr
+        # Checkpointing: "auto" (default: continuous on microVMs; every
+        # machine-observed step boundary and every exec), "per_exec",
+        # "manual" or "off"; snapshot_retention keeps the newest N replay
+        # points live.
+        if snapshot_policy is not None:
+            body["snapshot_policy"] = snapshot_policy
+        if snapshot_retention is not None:
+            body["snapshot_retention"] = int(snapshot_retention)
         timeout = 600
         if wait_for_slot is not None:
             body["wait_for_slot_sec"] = int(wait_for_slot)
@@ -239,10 +294,16 @@ class Sandboxes(_Resource):
     def resume(self, sandbox_id: str) -> dict:
         return self._c._post(f"/v1/sandboxes/{sandbox_id}/resume", {})
 
-    def export(self, sandbox_id: str, path: str, to: str | None = None) -> dict:
-        """Works during the run and after the sandbox terminated."""
+    def export(self, sandbox_id: str, path: str, to: str | None = None,
+               *, request_token: str | None = None) -> dict:
+        """Publish an archive; use exports.download with the returned export_id.
+
+        Reuse request_token after a lost response to avoid another export.
+        Post-termination creation requires a retained filesystem on the driver.
+        Already-published exports are independent of sandbox lifetime.
+        """
         return self._c._post(f"/v1/sandboxes/{sandbox_id}/export",
-                             {"path": path, "to": to}, timeout=1800)
+                             {"path": path, "to": to, "request_token": request_token}, timeout=1800)
 
     def destroy(self, sandbox_id: str) -> dict:
         """Returns the sandbox with teardown_proof attached."""
@@ -265,6 +326,13 @@ class Sandboxes(_Resource):
         """Freeze a running sandbox into a new template (fork point)."""
         return self._c._post(f"/v1/sandboxes/{sandbox_id}/checkpoint",
                              {"name": name}, timeout=900)
+
+    def snapshot(self, sandbox_id: str, label: str | None = None) -> dict:
+        """Take a replay point now (memory + filesystem). Returns the
+        snapshot row (id, size_bytes, sha256); it appears in snapshots()
+        and can be forked with fork(snapshot_id=...)."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/snapshot",
+                             {"label": label} if label else {}, timeout=300)
 
     def fork(self, sandbox_id: str, count: int = 1, *,
              ttl_seconds: int | None = None,
@@ -353,12 +421,82 @@ class Sandboxes(_Resource):
         """Replay header aggregates: counts, bytes, per-tool breakdown."""
         return self._c._get(f"/v1/sandboxes/{sandbox_id}/snapshots/stats")
 
-    def metrics(self, sandbox_id: str) -> dict:
-        """Observed cpu/mem samples while running."""
-        return self._c._get(f"/v1/sandboxes/{sandbox_id}/metrics")
+    def metrics(self, sandbox_id: str, *, limit: int = 2000,
+                before: int | None = None, until: str | None = None) -> dict:
+        """Bounded resource page, oldest first. Follow window.next_before for older pages.
+
+        until is an ISO-8601 timestamp with timezone. Averages describe this page;
+        recording.retained_samples counts all retained observations.
+        """
+        params = {"limit": limit}
+        if before is not None:
+            params["before"] = before
+        if until is not None:
+            params["until"] = until
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/metrics", params=params)
 
     def events(self, sandbox_id: str) -> list[dict]:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}/events")
+
+    # ---- machine-observed steps -------------------------------------------
+
+    def steps(self, sandbox_id: str, *, full: bool = False, limit: int = 2000) -> dict:
+        """Machine-observed steps, oldest first. A step is a boundary the guest
+        kernel reported (a finished process subtree or a burst of file
+        changes), the checkpoint taken there and the machine measured at that
+        moment. `full=True` adds the bounded record (lead process, accounting,
+        tests, file changes, top processes, network flows)."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/steps", params={"full": int(full), "limit": limit})
+
+    def steps_series(self, sandbox_id: str, fields: list[str] | None = None) -> dict:
+        """Columnar series aligned on `t` for charts; null means not measured."""
+        params = {"fields": ",".join(fields)} if fields else None
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/steps/series", params=params)
+
+    def network(self, sandbox_id: str) -> dict:
+        """What the workload reached and what stopped it, observed from
+        inside: remotes with names, bytes and outcomes, DNS names, denials
+        with the observed signature, policy changes and in-guest probes."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/network")
+
+    def steps_diff(self, sandbox_id: str, *, since: int = 0, until: int | None = None) -> dict:
+        """Files changed between two checkpoints, folded from the per-step
+        deltas: operations, sizes and source hashes at both ends."""
+        params: dict = {"since": since}
+        if until is not None:
+            params["until"] = until
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/steps/diff", params=params)
+
+    def cost(self, sandbox_id: str) -> dict:
+        """The compute charge decomposed into steps (busy versus idle CPU),
+        boot and tail; segments sum to the charge exactly."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/cost")
+
+    def timeline(self, sandbox_id: str) -> dict:
+        """Everything that happened to the sandbox in one ordered record."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/timeline")
+
+    def rerun_step(self, sandbox_id: str, seq: int, *, command: str | None = None, timeout_sec: int = 600,
+                   labels: dict[str, str] | None = None) -> dict:
+        """Rewind to step `seq` and run the next step again in a forked child;
+        returns the child, the exec with accounting, and the step comparison."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/steps/{seq}/rerun",
+                             {"command": command, "timeout_sec": timeout_sec, "labels": labels or {}}, timeout=timeout_sec + 300)
+
+    def compare_steps(self, sandbox_id: str, against: str, *, offset: int = 0, offset_against: int = 0) -> dict:
+        """Two sandboxes step by step on the same machine ruler."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/steps/compare",
+                            params={"against": against, "offset": offset, "offset_against": offset_against})
+
+    def exec_output(self, sandbox_id: str, exec_id: str, *, stream: str = "stdout") -> bytes:
+        """The full stream a command wrote when the exec response truncated
+        it (published by the worker after the command finished). Raises
+        NuminousError(cause=output_not_published) while it is still being
+        published and output_not_truncated when the response already held
+        everything."""
+        r = self._c._http.get(f"/v1/sandboxes/{sandbox_id}/execs/{exec_id}/output", params={"stream": stream})
+        self._c._raise_for(r)
+        return r.content
 
     def wait(self, sandbox_id: str, *, until: str = "terminated",
              timeout: float = 600, poll: float = 2.0) -> dict:
@@ -403,18 +541,31 @@ class Batches(_Resource):
 
 class Volumes(_Resource):
     def create(self, name: str, size_gib: float = 10.0,
-               kind: str = "sandbox", datacenter: str | None = None) -> dict:
+               kind: str = "sandbox", datacenter: str | None = None,
+               plane: str | None = None) -> dict:
         """Idempotent by name within your org; safe to call on every start.
 
-        kind="sandbox": host-local NVMe, mounts on CPU sandboxes ($0.10/GiB-mo).
+        kind="sandbox": a persistent volume for CPU sandboxes ($0.10/GiB-mo).
+        On the Firecracker plane (the default when that pool exists) it is a
+        durable ext4 image attached to the microVM as a block device: one
+        sandbox at a time, flushed to durable storage before that sandbox's
+        teardown completes, then attachable by the next sandbox on any
+        worker. plane="docker" is a host-local Docker volume on one worker.
         kind="gpu": RunPod network volume, datacenter-scoped, mounts on GPU
-        sandboxes only ($0.10/GiB-mo). The two kinds live on different
-        hardware and never cross.
+        sandboxes only ($0.10/GiB-mo). The kinds live on different hardware
+        and never cross.
         """
         body: dict = {"name": name, "size_gib": size_gib, "kind": kind}
         if datacenter:
             body["datacenter"] = datacenter
+        if plane:
+            body["plane"] = plane
         return self._c._post("/v1/volumes", body)
+
+    def get(self, volume_id: str) -> dict:
+        """One volume with its attachment state (attached_sandbox_id,
+        attach_generation, flushed_at, last flush manifest)."""
+        return self._c._get(f"/v1/volumes/{volume_id}")
 
     def list(self) -> list[dict]:
         return self._c._get("/v1/volumes")
@@ -501,6 +652,23 @@ class Trials(_Resource):
         sandboxes.set_outcome() are provisional; this one is final."""
         return self._c._put(f"/v1/trials/{trial}/outcome", {"value": value, "label": label, "kind": kind, "status": status, "force": force})
 
+    def steps(self, trial: str, *, full: bool = False) -> dict:
+        """Steps across every attempt of the trial, in observation order, each
+        tagged with its attempt, plus a combined series."""
+        return self._c._get(f"/v1/trials/{trial}/steps", params={"full": int(full)})
+
+    def network(self, trial: str) -> dict:
+        """Network observed across every attempt of the trial."""
+        return self._c._get(f"/v1/trials/{trial}/network")
+
+    def cost(self, trial: str) -> dict:
+        """The trial's compute charge decomposed into steps per attempt."""
+        return self._c._get(f"/v1/trials/{trial}/cost")
+
+    def timeline(self, trial: str) -> dict:
+        """The trial as one ordered record across every attempt."""
+        return self._c._get(f"/v1/trials/{trial}/timeline")
+
 
 class Runs(_Resource):
     def list(self, *, agent: str | None = None, task: str | None = None, source: str | None = None, q: str | None = None,
@@ -536,11 +704,63 @@ class Capacity(_Resource):
             "duration_minutes": duration_minutes, "labels": labels or {}})
 
 
+class Exports(_Resource):
+    @staticmethod
+    def _path(export_id: str) -> str:
+        if not re.fullmatch(r'exp_[A-Za-z0-9]+', export_id):
+            raise ValueError('invalid export identity')
+        return f'/v1/exports/{export_id}'
+
+    def get(self, export_id: str) -> dict:
+        """Return publication state, content digest and retention deadline."""
+        return self._c._get(self._path(export_id))
+
+    def download(self, export_id: str, destination: str | Path, *, max_bytes: int = 64 << 30) -> dict:
+        """Write a verified tar archive. Existing files are never overwritten."""
+        record = self.get(export_id)
+        if record.get('state') != 'done':
+            raise NuminousError('state', 'export is not available for download', 409, retryable=False)
+        size, expected = record.get('size_bytes'), record.get('sha256')
+        if (type(size) is not int or not 0 < size <= max_bytes or not isinstance(expected, str)
+                or not re.fullmatch(r'[a-f0-9]{64}', expected)):
+            raise NuminousError('provider_infra', 'invalid export metadata or download limit exceeded', 502)
+        target = Path(destination)
+        deadline = time.monotonic() + 1800
+        with target.open('xb') as output:
+            try:
+                with self._c._http.stream('GET', self._path(export_id) + '/download', timeout=60) as response:
+                    if response.status_code != 200:
+                        response.read()
+                        self._c._raise_for(response)
+                        raise NuminousError('provider_infra', 'unexpected artifact response', 502)
+                    if response.headers.get('content-length') != str(size):
+                        raise NuminousError('provider_infra', 'artifact size differs from metadata', 502)
+                    digest, count = hashlib.sha256(), 0
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('artifact download deadline exceeded')
+                        count += len(chunk)
+                        if count > size:
+                            raise NuminousError('provider_infra', 'artifact exceeds recorded size', 502)
+                        output.write(chunk)
+                        digest.update(chunk)
+                    if count != size or digest.hexdigest() != expected:
+                        raise NuminousError('provider_infra', 'artifact download checksum mismatch', 502)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+        return record | {'downloaded_to': str(target)}
+
+
 class Numinous:
     def __init__(self, api_url: str | None = None, api_key: str | None = None):
         self.api_url = (api_url or os.environ.get(
             "NUMINOUS_API_URL", "http://127.0.0.1:8400")).rstrip("/")
-        self.api_key = api_key or os.environ.get("NUMINOUS_API_KEY", "nk_local_dev")
+        selected_key = api_key if api_key is not None else os.environ.get("NUMINOUS_API_KEY", "")
+        if (not selected_key or selected_key == "nk_local_dev" or len(selected_key) > 512 or
+                any(ord(character) < 33 or ord(character) > 126 for character in selected_key)):
+            raise NuminousError("auth", "Configure NUMINOUS_API_KEY or pass api_key explicitly", 401)
+        self.api_key = selected_key
         self._http = httpx.Client(
             base_url=self.api_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -548,7 +768,9 @@ class Numinous:
         )
         self.templates = Templates(self)
         self.roms = Roms(self)
+        self.snapshots = Snapshots(self)
         self.sandboxes = Sandboxes(self)
+        self.exports = Exports(self)
         self.volumes = Volumes(self)
         self.usage = Usage(self)
         self.limits = Limits(self)
