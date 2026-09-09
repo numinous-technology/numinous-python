@@ -89,8 +89,16 @@ class Templates(_Resource):
         return self._c._post("/v1/templates", {"name": name, "source": source},
                              timeout=1800)
 
-    def list(self) -> list[dict]:
-        return self._c._get("/v1/templates")
+    def list(self, *, include_retired: bool = False) -> list[dict]:
+        """Ready and building templates. Retired ones are tombstones and are
+        left out unless asked for."""
+        return self._c._get("/v1/templates" + ("?include_retired=true" if include_retired else ""))
+
+    def retire(self, template_id: str) -> dict:
+        """Take a template out of service: nothing new boots from it, and
+        sandboxes already running from it are untouched. Refused with 409
+        while it still has live sandboxes."""
+        return self._c._delete(f"/v1/templates/{template_id}")
 
     def manifest(self, template_id: str) -> dict:
         """What the template contains, recorded at build (OS release, package
@@ -140,13 +148,25 @@ class Sandboxes(_Resource):
                volumes: list[dict] | None = None,
                snapshot_policy: str | None = None,
                snapshot_retention: int | None = None,
+               snapshot_ttl_seconds: int | None = None,
                gpu: int = 0, gpu_type: str | None = None,
                gpu_max_hr: float | None = None,
                plane: str = "auto",
+               wait: bool = True,
                wait_for_slot: int | None = None,
                retry_admission_sec: float = 0.0,
                attribution: Attribution | None = None) -> dict:
         """Create a sandbox.
+
+        wait: True (default) returns when the sandbox is running. False returns
+        as soon as the create is admitted and recorded (state "creating"); the
+        sandbox boots in the background and reaches "running" or a typed
+        failure moments later. Use wait=False for fan-out and follow with
+        wait_running(), or use create_many() for one request.
+
+        snapshot_ttl_seconds: optional age limit for replay points (for example
+        7 days = 604800). Independent of snapshot_retention (a count); either
+        retires a point. Change later with snapshot_policy().
 
         attribution: Attribution(run=, trial=, task=, agent=, ...) becomes
         `numinous.*` labels so the console groups this sandbox into its trial
@@ -197,6 +217,10 @@ class Sandboxes(_Resource):
             body["snapshot_policy"] = snapshot_policy
         if snapshot_retention is not None:
             body["snapshot_retention"] = int(snapshot_retention)
+        if snapshot_ttl_seconds is not None:
+            body["snapshot_ttl_seconds"] = int(snapshot_ttl_seconds)
+        if not wait:
+            body["wait"] = False
         timeout = 600
         if wait_for_slot is not None:
             body["wait_for_slot_sec"] = int(wait_for_slot)
@@ -217,6 +241,70 @@ class Sandboxes(_Resource):
 
     def get(self, sandbox_id: str) -> dict:
         return self._c._get(f"/v1/sandboxes/{sandbox_id}")
+
+    def create_many(self, specs: list[dict], *, retry_admission_sec: float = 0.0) -> dict:
+        """Admit many sandboxes in one request (up to 500).
+
+        Each spec takes the same keyword arguments as create(). Every item is
+        admitted independently and boots in the background; the answer lists
+        each item as {"ok": True, ...sandbox} or {"ok": False, "status", "cause",
+        "message"} in place. Follow with wait_running() on the admitted ids."""
+        items = []
+        for spec in specs:
+            spec = dict(spec)
+            attribution = spec.pop("attribution", None)
+            labels = {**(spec.pop("labels", None) or {}), **(attribution.labels() if attribution else {})}
+            body = {"template_id": spec.pop("template_id", None), "image": spec.pop("image", None),
+                    "rom_id": spec.pop("rom_id", None), "vcpu": spec.pop("vcpu", 2), "mem_gib": spec.pop("mem_gib", 4.0),
+                    "ttl_seconds": spec.pop("ttl_seconds", 0), "labels": labels,
+                    "network": {"egress": spec.pop("egress", "allow"), "allow": spec.pop("allow", None) or []},
+                    "env": spec.pop("env", None) or {}, "plane": spec.pop("plane", "auto"),
+                    "gpu": spec.pop("gpu", 0), "volumes": spec.pop("volumes", None) or []}
+            for key in ("disk_gib", "run_mode", "gpu_mode", "gpu_type", "gpu_max_hr", "snapshot_policy",
+                        "snapshot_retention", "snapshot_ttl_seconds", "auto_suspend_idle_seconds",
+                        "inference_sleep", "launch_token"):
+                if spec.get(key) is not None:
+                    body[key] = spec[key]
+            items.append(body)
+        deadline = time.monotonic() + max(0.0, retry_admission_sec)
+        delay = 2.0
+        while True:
+            try:
+                return self._c._post("/v1/sandboxes/batch", {"items": items}, timeout=900)
+            except NuminousError as e:
+                if not (e.retryable and time.monotonic() < deadline):
+                    raise
+                time.sleep(delay); delay = min(delay * 2, 20.0)
+
+    def wait_running(self, ids: list[str] | str, *, timeout: float = 600.0, poll: float = 1.0) -> dict[str, dict]:
+        """Wait until each sandbox has left `creating`. Returns id -> sandbox.
+        A sandbox that failed to boot is returned with its typed cause; it is
+        not raised, so a fan-out reports per item."""
+        pending = set([ids] if isinstance(ids, str) else ids)
+        out: dict[str, dict] = {}
+        deadline = time.monotonic() + timeout
+        while pending and time.monotonic() < deadline:
+            for sid in list(pending):
+                sb = self.get(sid)
+                if sb.get("state") != "creating":
+                    out[sid] = sb
+                    pending.discard(sid)
+            if pending:
+                time.sleep(poll)
+        for sid in pending:
+            out[sid] = {"id": sid, "state": "creating", "cause": "wait_timeout"}
+        return out
+
+    def snapshot_policy(self, sandbox_id: str, *, retention: int | None = None,
+                        ttl_seconds: int | None = None) -> dict:
+        """Change how long replay points are kept: a count, an age in seconds
+        (0 clears the age limit), or both. Applied asynchronously."""
+        body = {}
+        if retention is not None:
+            body["snapshot_retention"] = int(retention)
+        if ttl_seconds is not None:
+            body["snapshot_ttl_seconds"] = int(ttl_seconds)
+        return self._c._patch(f"/v1/sandboxes/{sandbox_id}/snapshot-policy", body)
 
     def set_outcome(self, sandbox_id: str, value: float | None, *, kind: str = "reward",
                     label: str | None = None, status: str | None = None) -> dict:
@@ -677,6 +765,14 @@ class Runs(_Resource):
         for k, v in (("agent", agent), ("task", task), ("source", source), ("q", q)):
             if v: params[k] = v
         return self._c._get("/v1/runs", params=params)
+
+    def get(self, run_key: str) -> dict | None:
+        """One run by key or display name, or None."""
+        page = self.list(q=run_key, limit=50)
+        for row in page.get("items", []):
+            if row.get("run") == run_key or row.get("name") == run_key or row.get("run_key") == run_key:
+                return row
+        return None
 
 
 class Limits(_Resource):

@@ -18,7 +18,9 @@ def _out(obj) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import __version__
     p = argparse.ArgumentParser(prog="numinous", description=__doc__)
+    p.add_argument("--version", action="version", version=f"numinous {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     tp = sub.add_parser("template", help="manage templates")
@@ -29,8 +31,17 @@ def main(argv: list[str] | None = None) -> int:
     pack.add_argument("--warm", help="command to run before snapshotting")
     tps.add_parser("list", help="list templates")
 
-    boot = sub.add_parser("boot", help="boot sandboxes from a template")
-    boot.add_argument("template_id")
+    boot = sub.add_parser("boot", help="boot sandboxes from a template or an image")
+    boot.add_argument("template_id", nargs="?", default=None, help="template id (omit with --image)")
+    boot.add_argument("--image", default=None, help="boot from a docker image instead of a template")
+    boot.add_argument("--no-wait", action="store_true",
+                      help="answer as soon as the create is admitted; sandboxes boot in the background "
+                           "(use `numinous wait` to block on running). With --count > 1 this sends one batch request.")
+    boot.add_argument("--egress", default="allow", choices=["allow", "deny", "allowlist"])
+    boot.add_argument("--allow", action="append", default=[], metavar="HOST", help="allowlisted host (repeatable)")
+    boot.add_argument("--rom", default=None, metavar="ROM_ID", help="mount a read-only input bundle at /rom")
+    boot.add_argument("--snapshot-ttl", type=int, default=None, metavar="SECONDS",
+                      help="retire replay points older than this (7 days = 604800)")
     boot.add_argument("--vcpu", type=int, default=2)
     boot.add_argument("--mem", type=float, default=4.0, help="GiB")
     boot.add_argument("--ttl", type=int, default=0, help="seconds; 0=default")
@@ -58,6 +69,9 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("sandbox_id")
     ex.add_argument("command")
     ex.add_argument("--timeout", type=float, default=300)
+    ex.add_argument("--json", action="store_true",
+                    help="print the full record (exit_code, stdout, stderr, accounting, exec_id) as JSON "
+                         "instead of behaving like ssh")
     ex.add_argument("--exclusive", action="store_true",
                     help="GPU plane: take an exclusive, quiet GPU for a "
                          "perf-timed section (evicts idle residents first)")
@@ -87,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
     ck = sub.add_parser("checkpoint", help="freeze a running sandbox into a template")
     ck.add_argument("sandbox_id")
     ck.add_argument("--name")
+
+    fk = sub.add_parser("fork", help="fork a live sandbox into children that start from its exact state")
+    fk.add_argument("sandbox_id")
+    fk.add_argument("--count", type=int, default=1)
+    fk.add_argument("--ttl", type=int, default=None, help="child TTL in seconds")
+    fk.add_argument("--label", action="append", default=[], metavar="K=V")
 
     sp = sub.add_parser("snapshot", help="take a replay point (memory + filesystem) now")
     sp.add_argument("sandbox_id")
@@ -145,7 +165,53 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("capacity", help="free capacity")
     sub.add_parser("pricing", help="current rates")
 
+    wt = sub.add_parser("wait", help="wait until sandboxes have left `creating`")
+    wt.add_argument("sandbox_ids", nargs="+")
+    wt.add_argument("--timeout", type=float, default=600)
+
+    spol = sub.add_parser("snapshot-policy", help="change how long a sandbox keeps replay points")
+    spol.add_argument("sandbox_id")
+    spol.add_argument("--retention", type=int, default=None, help="keep the newest N")
+    spol.add_argument("--ttl", type=int, default=None, metavar="SECONDS", help="age limit; 0 clears it")
+
+    tr = sub.add_parser("trials", help="trials (materialised from numinous.trial labels)")
+    trs = tr.add_subparsers(dest="trcmd", required=True)
+    trl = trs.add_parser("list"); trl.add_argument("--run", default=None); trl.add_argument("--agent", default=None)
+    trl.add_argument("--state", default=None); trl.add_argument("--limit", type=int, default=50)
+    trg = trs.add_parser("get"); trg.add_argument("trial_key")
+    for name in ("steps", "cost", "timeline", "network"):
+        x = trs.add_parser(name); x.add_argument("trial_key")
+
+    rn = sub.add_parser("runs", help="runs (groups of trials)")
+    rns = rn.add_subparsers(dest="rncmd", required=True)
+    rns.add_parser("list").add_argument("--limit", type=int, default=50)
+    rns.add_parser("get").add_argument("run_key")
+
+    rom = sub.add_parser("rom", help="read-only input bundles mounted at /rom")
+    roms = rom.add_subparsers(dest="rcmd", required=True)
+    rc = roms.add_parser("create"); rc.add_argument("--name", required=True)
+    rc.add_argument("--file", action="append", default=[], metavar="PATH=LOCALFILE",
+                    help="path inside /rom and the local file to read (repeatable)")
+    roms.add_parser("list")
+
+    sk = sub.add_parser("skill", help="print the skill file an agent reads to drive this CLI")
+    sk.add_argument("--install", default=None, metavar="DIR", help="also write it to DIR/SKILL.md")
+
+    sub.add_parser("whoami", help="which organisation this key belongs to")
+
     a = p.parse_args(argv)
+    if a.cmd == "skill":
+        # Documentation needs no key: an agent reads this before it has one.
+        from .skill import SKILL
+        if a.install:
+            import os
+            os.makedirs(a.install, exist_ok=True)
+            with open(os.path.join(a.install, "SKILL.md"), "w") as fh:
+                fh.write(SKILL)
+            print(os.path.join(a.install, "SKILL.md"))
+        else:
+            print(SKILL)
+        return 0
     try:
         nc = Numinous()
         if a.cmd == "template" and a.tcmd == "pack":
@@ -153,24 +219,60 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "template" and a.tcmd == "list":
             _out(nc.templates.list())
         elif a.cmd == "boot":
+            if not a.template_id and not a.image:
+                raise ValueError("give a template id or --image")
             labels = dict(kv.split("=", 1) for kv in a.label)
-            out = []
-            for i in range(a.count):
-                tok = f"{a.token}-{i}" if a.token and a.count > 1 else a.token
-                out.append(nc.sandboxes.create(
-                    template_id=a.template_id, vcpu=a.vcpu, mem_gib=a.mem,
-                    ttl_seconds=a.ttl, labels=labels, launch_token=tok,
-                    auto_suspend_idle_seconds=a.auto_suspend,
-                    inference_sleep=a.inference_sleep,
-                    gpu=(a.gpu_count if a.gpu else 0), gpu_type=a.gpu,
-                    gpu_max_hr=a.gpu_max_hr,
-                    snapshot_policy=a.snapshot_policy, snapshot_retention=a.snapshot_retention,
-                    volumes=[{"volume_id": v.split(":", 1)[0], "mount_path": v.split(":", 1)[1]} for v in a.volume] or None))
-            _out(out if a.count > 1 else out[0])
+            volumes = [{"volume_id": v.split(":", 1)[0], "mount_path": v.split(":", 1)[1]} for v in a.volume] or None
+            common = dict(template_id=a.template_id, image=a.image, rom_id=a.rom, vcpu=a.vcpu, mem_gib=a.mem,
+                          egress=a.egress, allow=a.allow or None,
+                          ttl_seconds=a.ttl, labels=labels, auto_suspend_idle_seconds=a.auto_suspend,
+                          inference_sleep=a.inference_sleep, gpu=(a.gpu_count if a.gpu else 0), gpu_type=a.gpu,
+                          gpu_max_hr=a.gpu_max_hr, snapshot_policy=a.snapshot_policy,
+                          snapshot_retention=a.snapshot_retention, snapshot_ttl_seconds=a.snapshot_ttl,
+                          volumes=volumes)
+            if a.no_wait and a.count > 1:
+                # one request admits the whole fan-out; boots run in the background
+                specs = [dict(common, launch_token=(f"{a.token}-{i}" if a.token else None)) for i in range(a.count)]
+                _out(nc.sandboxes.create_many(specs))
+            else:
+                out = []
+                for i in range(a.count):
+                    tok = f"{a.token}-{i}" if a.token and a.count > 1 else a.token
+                    out.append(nc.sandboxes.create(launch_token=tok, wait=not a.no_wait, **common))
+                _out(out if a.count > 1 else out[0])
+        elif a.cmd == "wait":
+            _out(nc.sandboxes.wait_running(a.sandbox_ids, timeout=a.timeout))
+        elif a.cmd == "snapshot-policy":
+            _out(nc.sandboxes.snapshot_policy(a.sandbox_id, retention=a.retention, ttl_seconds=a.ttl))
+        elif a.cmd == "trials":
+            if a.trcmd == "list":
+                filters = {k: v for k, v in (("agent", a.agent), ("state", a.state)) if v}
+                _out(nc.trials.list(run=a.run, filters=filters or None, limit=a.limit))
+            elif a.trcmd == "get":
+                _out(nc.trials.get(a.trial_key))
+            else:
+                _out(getattr(nc.trials, a.trcmd)(a.trial_key))
+        elif a.cmd == "runs":
+            _out(nc.runs.list(limit=a.limit) if a.rncmd == "list" else nc.runs.get(a.run_key))
+        elif a.cmd == "rom":
+            if a.rcmd == "create":
+                files = {}
+                for spec in a.file:
+                    inside, local = spec.split("=", 1)
+                    with open(local) as fh:
+                        files[inside] = fh.read()
+                _out(nc.roms.create(a.name, files))
+            else:
+                _out(nc.roms.list())
+        elif a.cmd == "whoami":
+            _out(nc.whoami())
         elif a.cmd == "exec":
             env = {"GPU_EXCLUSIVE": "1"} if a.exclusive else {}
             r = nc.sandboxes.exec(a.sandbox_id, a.command, timeout_sec=a.timeout,
                                   env=env)
+            if a.json:
+                _out(r)
+                return 0
             sys.stdout.write(r["stdout"])
             sys.stderr.write(r["stderr"])
             return r["exit_code"]
@@ -198,6 +300,9 @@ def main(argv: list[str] | None = None) -> int:
             _out(nc.sandboxes.destroy(a.sandbox_id))
         elif a.cmd == "checkpoint":
             _out(nc.sandboxes.checkpoint(a.sandbox_id, name=a.name))
+        elif a.cmd == "fork":
+            labels = dict(kv.split("=", 1) for kv in a.label if "=" in kv)
+            _out(nc.sandboxes.fork(a.sandbox_id, count=a.count, ttl_seconds=a.ttl, labels=labels))
         elif a.cmd == "snapshot":
             _out(nc.sandboxes.snapshot(a.sandbox_id, label=a.label))
         elif a.cmd == "metrics":
