@@ -128,6 +128,18 @@ class Snapshots(_Resource):
     def listdir(self, snapshot_id: str, path: str = "/") -> list[dict]:
         return self._c._get(f"/v1/snapshots/{snapshot_id}/files", params={"path": path, "list": 1})["entries"]
 
+    def fork(self, snapshot_id: str, count: int = 1, *, ttl_seconds: int | None = None,
+             labels: dict | None = None) -> dict:
+        """Start `count` sandboxes from this checkpoint's exact state.
+
+        sandboxes.fork() branches a machine that is still running; this
+        branches a recorded moment, so a trial can be reopened at any step
+        long after it ended. Returns {snapshot, requested, created,
+        children:[...]}."""
+        return self._c._post(f"/v1/snapshots/{snapshot_id}/fork",
+                             {"count": count, "ttl_seconds": ttl_seconds,
+                              "labels": labels or {}}, timeout=900)
+
 
 class Roms(_Resource):
     def create(self, name: str, files: dict[str, str]) -> dict:
@@ -398,11 +410,39 @@ class Sandboxes(_Resource):
         return self._c._delete(f"/v1/sandboxes/{sandbox_id}")
 
 
-    def put_file(self, sandbox_id: str, path: str, data: bytes) -> dict:
+    # One inline request is bounded by the control plane's inline_file_max_mib
+    # (47 MiB by default), and a larger file must arrive in pieces that the
+    # guest appends. A caller should not have to know that: put_file splits.
+    PIECE_BYTES = 32 << 20
+
+    def put_file(self, sandbox_id: str, path: str, data: bytes,
+                 *, piece_bytes: int | None = None) -> dict:
+        """Write bytes to a path inside the sandbox.
+
+        Anything larger than one request is sent as appended pieces, so a
+        multi-gigabyte file is a normal call. The last piece commits: until it
+        lands the destination is untouched, so a failure mid-transfer never
+        leaves a half-written file where the workload can read it.
+
+        Mode bits are not part of the write; run `chmod` with exec() when a
+        script must be executable.
+        """
         import base64
-        return self._c._put(f"/v1/sandboxes/{sandbox_id}/files",
-                            {"path": path,
-                             "content_b64": base64.b64encode(data).decode()})
+        piece = int(piece_bytes or self.PIECE_BYTES)
+        if piece < 1:
+            raise ValueError("piece_bytes must be positive")
+        body = {"path": path}
+        if len(data) <= piece:
+            return self._c._put(f"/v1/sandboxes/{sandbox_id}/files",
+                                {**body, "content_b64": base64.b64encode(data).decode()})
+        result = None
+        for offset in range(0, len(data), piece):
+            chunk = data[offset:offset + piece]
+            last = offset + piece >= len(data)
+            result = self._c._put(f"/v1/sandboxes/{sandbox_id}/files",
+                                  {**body, "content_b64": base64.b64encode(chunk).decode(),
+                                   "append": offset > 0, "final": last})
+        return result
 
     def get_file(self, sandbox_id: str, path: str) -> bytes:
         import base64
@@ -879,6 +919,12 @@ class Numinous:
 
     def pricing(self) -> dict:
         return self._get("/v1/pricing")
+
+    def sizes(self) -> dict:
+        """The named machine sizes (vCPU, memory, GPU) a create can ask for,
+        with what each costs. Naming a size is how a caller stays correct when
+        the catalogue changes."""
+        return self._get("/v1/sizes")
 
     def whoami(self) -> dict:
         return self._get("/v1/whoami")
