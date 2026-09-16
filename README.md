@@ -48,6 +48,18 @@ nc.sandboxes.cost(sb["id"])                               # what each step cost,
 nc.sandboxes.timeline(sb["id"])                           # everything recorded, in order
 ```
 
+Files of any size, checkpoints you can branch, and the size catalogue:
+
+```python
+nc.sandboxes.put_file(sb["id"], "/data/weights.bin", open("weights.bin", "rb").read())
+# past one request the bytes go as appended pieces and the last piece commits,
+# so a failure mid-transfer never leaves a half-written file in the sandbox
+snap = nc.sandboxes.snapshot(sb["id"], label="before the risky step")
+nc.snapshots.read(snap["id"], "/workspace/state.json")     # read without booting it
+child = nc.snapshots.fork(snap["id"], count=4)              # four sandboxes from that exact moment
+nc.sizes()                                                  # the machine sizes a create can name
+```
+
 Persistent volumes (Firecracker plane: one sandbox at a time, flushed to
 durable storage before that sandbox's teardown completes):
 
