@@ -114,6 +114,14 @@ class Templates(_Resource):
 
 
 class Snapshots(_Resource):
+    def pin(self, snapshot_id: str) -> dict:
+        """Exempt one checkpoint from both retention clocks until unpinned
+        (its sandbox's memory chain is held with it). Standard storage rate."""
+        return self._c._post(f"/v1/snapshots/{snapshot_id}/pin", {})
+
+    def unpin(self, snapshot_id: str) -> dict:
+        return self._c._delete(f"/v1/snapshots/{snapshot_id}/pin")
+
     def file(self, snapshot_id: str, path: str, *, max_bytes: int = 16 << 20) -> dict:
         """A file exactly as it was at the checkpoint, read from the
         checkpoint's root disk without booting it. `content_b64` holds the
@@ -136,9 +144,10 @@ class Snapshots(_Resource):
         branches a recorded moment, so a trial can be reopened at any step
         long after it ended. Returns {snapshot, requested, created,
         children:[...]}."""
-        return self._c._post(f"/v1/snapshots/{snapshot_id}/fork",
-                             {"count": count, "ttl_seconds": ttl_seconds,
-                              "labels": labels or {}}, timeout=900)
+        body: dict = {"count": count, "labels": labels or {}}
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = ttl_seconds
+        return self._c._post(f"/v1/snapshots/{snapshot_id}/fork", body, timeout=900)
 
 
 class Roms(_Resource):
@@ -150,7 +159,7 @@ class Sandboxes(_Resource):
     def create(self, *, template_id: str | None = None, image: str | None = None,
                rom_id: str | None = None, vcpu: int = 2, mem_gib: float = 4.0,
                disk_gib: float | None = None, run_mode: str | None = None,
-               gpu_mode: str | None = None,
+               gpu_mode: str | None = None, gpu_oversubscribe: bool = False,
                ttl_seconds: int = 0, launch_token: str | None = None,
                labels: dict[str, str] | None = None,
                egress: str = "allow", allow: list[str] | None = None,
@@ -161,6 +170,10 @@ class Sandboxes(_Resource):
                snapshot_policy: str | None = None,
                snapshot_retention: int | None = None,
                snapshot_ttl_seconds: int | None = None,
+               memory_ttl_seconds: int | None = None,
+               retention: str | dict | None = None,
+               model_spend_pause_usd: float | None = None,
+               gpu_fraction: float | None = None,
                gpu: int = 0, gpu_type: str | None = None,
                gpu_max_hr: float | None = None,
                plane: str = "auto",
@@ -204,7 +217,7 @@ class Sandboxes(_Resource):
         body = {
             "template_id": template_id, "image": image, "rom_id": rom_id,
             "vcpu": vcpu, "mem_gib": mem_gib, "disk_gib": disk_gib,
-            "run_mode": run_mode, "gpu_mode": gpu_mode,
+            "run_mode": run_mode, "gpu_mode": gpu_mode, "gpu_oversubscribe": gpu_oversubscribe,
             "ttl_seconds": ttl_seconds,
             "launch_token": launch_token, "labels": {**(labels or {}), **(attribution.labels() if attribution else {})},
             "network": {"egress": egress, "allow": allow or []},
@@ -231,6 +244,23 @@ class Sandboxes(_Resource):
             body["snapshot_retention"] = int(snapshot_retention)
         if snapshot_ttl_seconds is not None:
             body["snapshot_ttl_seconds"] = int(snapshot_ttl_seconds)
+        if memory_ttl_seconds is not None:
+            body["memory_ttl_seconds"] = int(memory_ttl_seconds)
+        if retention is not None:
+            # a named strategy ("default", "memory_7d", "7d", "30d", "forever")
+            # or {"memory_ttl_seconds": ..., "snapshot_ttl_seconds": ...}; 0 = never
+            if isinstance(retention, dict):
+                for k in ("memory_ttl_seconds", "snapshot_ttl_seconds"):
+                    if retention.get(k) is not None:
+                        body[k] = int(retention[k])
+            else:
+                body["retention"] = str(retention)
+        if model_spend_pause_usd is not None:
+            body["model_spend_pause_usd"] = float(model_spend_pause_usd)
+        if gpu_fraction is not None:
+            # a persistent share of one pooled card (gpu_mode="shared"):
+            # SM cap and memory cap, billed by occupancy at that fraction
+            body["gpu_fraction"] = float(gpu_fraction)
         if not wait:
             body["wait"] = False
         timeout = 600
@@ -308,14 +338,29 @@ class Sandboxes(_Resource):
         return out
 
     def snapshot_policy(self, sandbox_id: str, *, retention: int | None = None,
-                        ttl_seconds: int | None = None) -> dict:
-        """Change how long replay points are kept: a count, an age in seconds
-        (0 clears the age limit), or both. Applied asynchronously."""
-        body = {}
+                        ttl_seconds: int | None = None, memory_ttl_seconds: int | None = None,
+                        preset: str | None = None, inherit: bool = False) -> dict:
+        """Change how long checkpoints are kept, at any time.
+
+        Two clocks start when the sandbox ends: `memory_ttl_seconds` drops the
+        memory (bases and diffs; every checkpoint stays as a filesystem
+        checkpoint) and `ttl_seconds` retires the checkpoint entirely. 0 means
+        never. `preset` names a strategy: "default" (memory 24 h, filesystem
+        7 d), "memory_7d" (7 d / 30 d), "7d", "30d", "forever". `inherit=True`
+        clears both clocks back to the org's default. `retention` is the
+        optional count cap. Pinned checkpoints are exempt from both clocks.
+        Returns the effective policy."""
+        body: dict = {}
         if retention is not None:
             body["snapshot_retention"] = int(retention)
         if ttl_seconds is not None:
             body["snapshot_ttl_seconds"] = int(ttl_seconds)
+        if memory_ttl_seconds is not None:
+            body["memory_ttl_seconds"] = int(memory_ttl_seconds)
+        if preset is not None:
+            body["retention"] = preset
+        if inherit:
+            body["inherit"] = True
         return self._c._patch(f"/v1/sandboxes/{sandbox_id}/snapshot-policy", body)
 
     def set_outcome(self, sandbox_id: str, value: float | None, *, kind: str = "reward",
@@ -332,13 +377,42 @@ class Sandboxes(_Resource):
             labels["numinous.status"] = status
         return self.set_labels(sandbox_id, labels)
 
+    def fanout(self, count: int, *, template_id: str | None = None, image: str | None = None,
+               size: str | None = None, vcpu: int = 2, mem_gib: float = 4.0, ttl_seconds: int | None = None,
+               labels: dict[str, str] | None = None, env: dict[str, str] | None = None,
+               network: dict | None = None, snapshot_policy: str | None = None,
+               disk_gib: float | None = None) -> dict:
+        """Create `count` identical sandboxes (1..100) with ONE credit
+        reservation and no wait on any worker. Every item comes back in
+        state `creating`; readiness is observed by get() or by exec().
+
+        Returns {lease_id, admitted, lease_admission, items}. Each item is
+        either {ok: true, ...sandbox} or a typed per-item refusal
+        {ok: false, status, cause, retryable, message}, so a partial fit is
+        reported in place rather than failing the whole request.
+
+        Volumes, ROMs and GPUs are not on this path (typed 422); use
+        create() for those. This is the burst path for CPU trials.
+        """
+        body: dict[str, Any] = {"count": count, "vcpu": vcpu, "mem_gib": mem_gib}
+        if template_id: body["template_id"] = template_id
+        if image: body["image"] = image
+        if size: body["size"] = size
+        if ttl_seconds: body["ttl_seconds"] = ttl_seconds
+        if labels: body["labels"] = labels
+        if env: body["env"] = env
+        if network: body["network"] = network
+        if snapshot_policy: body["snapshot_policy"] = snapshot_policy
+        if disk_gib: body["disk_gib"] = disk_gib
+        return self._c._post("/v1/sandboxes/fanout", body, timeout=300)
+
     def set_labels(self, sandbox_id: str, labels: dict[str, str | None]) -> dict:
         """Merge labels onto a sandbox in any state (null deletes a key).
         Harnesses learn the experiment, agent, and reward after create; the
         console groups and grades by these labels."""
         return self._c._patch(f"/v1/sandboxes/{sandbox_id}/labels", {"labels": labels})
 
-    def list(self, *, label: str | None = None, state: str | None = None,
+    def list(self, *, label: str | list[str] | None = None, state: str | None = None,
              limit: int | None = None, offset: int = 0) -> list[dict]:
         """Sandboxes visible to this key (the org's). Unpaged by default for
         compatibility; pass limit (<= 200) to page, or use list_all()."""
@@ -353,7 +427,7 @@ class Sandboxes(_Resource):
         out = self._c._get("/v1/sandboxes", params=params)
         return out if isinstance(out, list) else out.get("items", [])
 
-    def list_page(self, *, label: str | None = None, state: str | None = None,
+    def list_page(self, *, label: str | list[str] | None = None, state: str | None = None,
                   limit: int = 200, offset: int = 0) -> dict:
         """One page: {items, total, limit, offset}."""
         params: dict[str, Any] = {"limit": limit, "offset": offset}
@@ -363,7 +437,7 @@ class Sandboxes(_Resource):
             params["state"] = state
         return self._c._get("/v1/sandboxes", params=params)
 
-    def list_all(self, *, label: str | None = None, state: str | None = None,
+    def list_all(self, *, label: str | list[str] | None = None, state: str | None = None,
                  page: int = 200, max_pages: int = 100) -> list[dict]:
         """Every matching sandbox, walking pages of `page` until `total`."""
         out: list[dict] = []
@@ -404,6 +478,38 @@ class Sandboxes(_Resource):
         """
         return self._c._post(f"/v1/sandboxes/{sandbox_id}/export",
                              {"path": path, "to": to, "request_token": request_token}, timeout=1800)
+
+    def report_spend(self, sandbox_id: str, *, source: str, kind: str = "usage",
+                     amount_usd: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
+                     cumulative_usd: float | None = None, note: dict | None = None) -> dict:
+        """Report model spend against a sandbox, or that its model credit ran
+        out (`credit_exhausted`) or came back (`credit_restored`).
+
+        Reaching the `model_spend_pause_usd` set at create, or an exhaustion
+        signal, pauses the sandbox: suspended in ~34 ms, billed for storage
+        only, TTL clock stopped. A restoration signal or resume() continues it
+        exactly where it was. Pausing is a state, never a failure."""
+        return self._c._post(f"/v1/sandboxes/{sandbox_id}/spend",
+                             {"source": source, "kind": kind, "amount_usd": amount_usd,
+                              "tokens_in": tokens_in, "tokens_out": tokens_out,
+                              "cumulative_usd": cumulative_usd, "note": note or {}})
+
+    def spend(self, sandbox_id: str) -> dict:
+        """Model spend reported so far, the budget, and whether the sandbox is
+        paused for it."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/spend")
+
+    def network_manifest(self, sandbox_id: str) -> dict:
+        """What egress policy actually applied to this sandbox, and which
+        mechanism enforced it. This is the record to hand an auditor: the
+        resolver pinned every address it returned, the kernel permitted only
+        those, and the splicer checked the server name."""
+        return self._c._get(f"/v1/sandboxes/{sandbox_id}/network/manifest")
+
+    def activity(self, sandbox_ids: list[str]) -> dict:
+        """Last observed activity for many sandboxes in one call, for a
+        supervisor deciding what is stalled without polling each one."""
+        return self._c._post("/v1/sandboxes/activity", {"ids": list(sandbox_ids)})
 
     def destroy(self, sandbox_id: str) -> dict:
         """Returns the sandbox with teardown_proof attached."""
@@ -464,14 +570,38 @@ class Sandboxes(_Resource):
 
     def fork(self, sandbox_id: str, count: int = 1, *,
              ttl_seconds: int | None = None,
-             labels: dict | None = None) -> dict:
+             labels: dict | None = None,
+             wait: bool = True, timeout: float = 300) -> dict:
         """Fork a live sandbox into `count` children that start from its exact
         state (copy-on-write memory on the firecracker plane, committed rootfs
         on the docker plane). The parent keeps running. Returns
-        {parent, snapshot_ref, requested, created, children:[...]}."""
-        return self._c._post(f"/v1/sandboxes/{sandbox_id}/fork",
-                             {"count": count, "ttl_seconds": ttl_seconds,
-                              "labels": labels or {}}, timeout=900)
+        {parent, snapshot_ref, requested, created, children:[...]}.
+
+        The control plane acknowledges a fork before the children have
+        booted (they come back `creating`). With wait=True (default) each
+        child is polled to `running` or a terminal state and the returned
+        children carry their final rows; wait=False returns the ack as is."""
+        body: dict = {"count": count, "labels": labels or {}}
+        if ttl_seconds is not None:   # the API takes an integer or nothing; null is refused
+            body["ttl_seconds"] = ttl_seconds
+        out = self._c._post(f"/v1/sandboxes/{sandbox_id}/fork", body, timeout=900)
+        if wait:
+            out["children"] = self._settle_children(out.get("children") or [], timeout)
+        return out
+
+    def _settle_children(self, children: list[dict], timeout: float) -> list[dict]:
+        deadline = time.monotonic() + timeout
+        settled: list[dict] = []
+        for ch in children:
+            if ch.get("state") in ("running", "failed", "terminated"):
+                settled.append(ch); continue
+            sid = ch["id"]
+            while True:
+                row = self.get(sid)
+                if row["state"] in ("running", "failed", "terminated") or time.monotonic() >= deadline:
+                    settled.append(row); break
+                time.sleep(0.5)
+        return settled
 
     def snapshots(self, sandbox_id: str, limit: int = 500, *,
                   verify: bool = False) -> list[dict]:
@@ -646,11 +776,62 @@ class Stats(_Resource):
         """Whole-trial rollup by label, e.g. 'harbor.session_id:trial-x'."""
         return self._c._get("/v1/rollup", params={"label": label})
 
+    def summary(self, days: int = 7, tz: str = "UTC") -> dict:
+        """Org totals over `days`: sandboxes, compute spans, spend, faults."""
+        return self._c._get("/v1/stats", params={"days": days, "tz": tz})
+
+    def latency(self, days: int = 14, *, driver: str | None = None, template_id: str | None = None) -> dict:
+        """p50/p90/p95/p99 for startup, fork, resume and checkpoint pause
+        from the platform's records of this org's sandboxes over `days`.
+        Each series carries its definition, its source rows, n, min, max."""
+        params = {"days": days}
+        if driver:
+            params["driver"] = driver
+        if template_id:
+            params["template_id"] = template_id
+        return self._c._get("/v1/latency", params=params)
+
+    def timeseries(self, *, hours: str = "24", step: int = 5, tz: str = "UTC",
+                   run: str | None = None, agent: str | None = None,
+                   task: str | None = None,
+                   filters: dict[str, str] | None = None) -> dict:
+        """Bucketed activity over time, filtered the same way trials are.
+        `hours` is a string because the API also accepts spans like '7d'."""
+        params: dict[str, Any] = {"hours": hours, "step": step, "tz": tz}
+        if run:
+            params["experiment"] = run
+        if agent:
+            params["agent"] = agent
+        if task:
+            params["task"] = task
+        if filters:
+            params["filter"] = [f"{k}:{v}" for k, v in filters.items()]
+        return self._c._get("/v1/stats/timeseries", params=params)
+
     def concurrency(self, hours: int = 24, step_minutes: int = 5) -> dict:
         """Concurrent running sandboxes over time (the scale graph)."""
         return self._c._get("/v1/stats/concurrency",
                             params={"hours": hours,
                                     "step_minutes": step_minutes})
+
+
+class Billing(_Resource):
+    def balance(self) -> dict:
+        """This org's credit position: granted, consumed, remaining, and each
+        grant with its expiry. Credits are prepaid and consumed FIFO, so the
+        first entry is the one being drawn down now."""
+        return self._c._get("/v1/billing")
+
+
+class Labels(_Resource):
+    def values(self, key: str, *, q: str = "", limit: int = 50,
+               offset: int = 0) -> dict:
+        """Distinct values seen for a label key, for building a filter UI
+        without hard-coding what a harness happens to emit."""
+        params: dict[str, Any] = {"key": key, "limit": limit, "offset": offset}
+        if q:
+            params["q"] = q
+        return self._c._get("/v1/labels/values", params=params)
 
 
 class Batches(_Resource):
@@ -797,6 +978,40 @@ class Trials(_Resource):
         """The trial as one ordered record across every attempt."""
         return self._c._get(f"/v1/trials/{trial}/timeline")
 
+    def report_spend(self, trial: str, *, source: str, kind: str = "usage",
+                     amount_usd: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
+                     cumulative_usd: float | None = None, note: dict | None = None) -> dict:
+        """Report model spend against a whole trial rather than one sandbox.
+
+        A harness that retries knows the trial key before it knows which
+        sandbox the next attempt will get, so this is the call that works
+        across attempts: the signal applies to the trial's current attempt
+        and any later one. Same kinds as the sandbox call: `usage`,
+        `credit_exhausted`, `credit_restored`."""
+        return self._c._post(f"/v1/trials/{trial}/spend",
+                             {"source": source, "kind": kind, "amount_usd": amount_usd,
+                              "tokens_in": tokens_in, "tokens_out": tokens_out,
+                              "cumulative_usd": cumulative_usd, "note": note or {}})
+
+
+    def pin(self, trial: str) -> dict:
+        """Pin every checkpoint of every attempt of a trial."""
+        return self._c._post(f"/v1/trials/{trial}/pin", {})
+
+    def unpin(self, trial: str) -> dict:
+        return self._c._delete(f"/v1/trials/{trial}/pin")
+
+    def detail(self, trial: str, *, include_steps: bool = False, full: bool = False) -> dict:
+        """One trial by key: {trial, attempts, cost, timeline} in one call.
+        include_steps adds `steps`: every attempt's steps tagged by attempt,
+        so a viewer loads once and switches attempts without another call."""
+        params: dict = {}
+        if include_steps:
+            params["include"] = "steps"
+            if full:
+                params["full"] = 1
+        return self._c._get(f"/v1/trials/{trial}/detail", params or None)
+
 
 class Runs(_Resource):
     def list(self, *, agent: str | None = None, task: str | None = None, source: str | None = None, q: str | None = None,
@@ -805,6 +1020,36 @@ class Runs(_Resource):
         for k, v in (("agent", agent), ("task", task), ("source", source), ("q", q)):
             if v: params[k] = v
         return self._c._get("/v1/runs", params=params)
+
+    def get(self, run: str) -> dict:
+        """One run by key with its trials: {run, trials}."""
+        return self._c._get(f"/v1/runs/{run}")
+
+    def set_title(self, run: str, title: str | None) -> dict:
+        """A person's name for the run ("Terminal-Bench 4"); shares and pages
+        show it and its URL slug. None or "" clears it. The harness's own
+        run_name stays in `name`."""
+        return self._c._patch(f"/v1/runs/{run}", {"title": title or ""})
+
+
+class Shares(_Resource):
+    """Read-only links to a run or a trial that work without credentials.
+    Scope is exactly the shared object; public payloads carry no environment,
+    allow lists or tokens."""
+
+    def create(self, kind: str, key: str, *, expires_in_days: int | None = 30, title: str | None = None) -> dict:
+        """kind is "run" or "trial". Returns {token, url, kind, key, title, slug, expires_at};
+        the url carries the slug of the title (the share's, else the run's)."""
+        body = {"kind": kind, "key": key, "expires_in_days": expires_in_days}
+        if title:
+            body["title"] = title
+        return self._c._post("/v1/shares", body)
+
+    def list(self) -> dict:
+        return self._c._get("/v1/shares")
+
+    def revoke(self, token: str) -> dict:
+        return self._c._delete(f"/v1/shares/{token}")
 
     def get(self, run_key: str) -> dict | None:
         """One run by key or display name, or None."""
@@ -838,6 +1083,18 @@ class Capacity(_Resource):
         return self._c._post("/v1/reservations", {
             "vcpu": vcpu, "mem_gib": mem_gib, "count": count,
             "duration_minutes": duration_minutes, "labels": labels or {}})
+
+    def reservations(self) -> list[dict]:
+        """Reservations this org holds, each with what it costs and when it
+        expires."""
+        return self._c._get("/v1/reservations")
+
+    def release(self, reservation_id: str) -> dict:
+        """Release a reservation and stop paying for it.
+
+        The SDK could create one of these and not cancel it, which is a bill a
+        customer cannot stop from the client they bought with."""
+        return self._c._delete(f"/v1/reservations/{reservation_id}")
 
 
 class Exports(_Resource):
@@ -888,6 +1145,100 @@ class Exports(_Resource):
         return record | {'downloaded_to': str(target)}
 
 
+class Cells:
+    """Which cell this key's org lives in. Routine callers never need it:
+    the client follows a cell redirect on its own."""
+
+    def __init__(self, c: "Numinous"):
+        self._c = c
+
+    def route(self) -> dict:
+        """{org, cell, local, api_url} for the caller."""
+        return self._c._get("/v1/cells/route")
+
+
+class GpuBatch:
+    """A submitted flexible batch: jobs and a deadline, packed onto idle GPU
+    seats, billed at the rate quoted when it was submitted."""
+
+    def __init__(self, c: "Numinous", data: dict):
+        self._c, self.id, self._data = c, data["id"], data
+
+    def status(self) -> dict:
+        self._data = self._c._get(f"/v1/gpu/batches/{self.id}")
+        return self._data
+
+    def job(self, job_id: str) -> dict:
+        return self._c._get(f"/v1/gpu/batches/{self.id}/jobs/{job_id}")
+
+    def wait(self, *, timeout: float = 86400.0, poll: float = 10.0) -> dict:
+        """Until the batch is done, cancelled or missed. Returns its status."""
+        import time as _t
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            st = self.status()
+            if st["state"] != "open":
+                return st
+            _t.sleep(poll)
+        return self.status()
+
+    def cancel(self) -> dict:
+        return self._c._delete(f"/v1/gpu/batches/{self.id}")
+
+    @property
+    def at_risk(self) -> bool:
+        return bool(self._data.get("at_risk"))
+
+
+class GpuBatchBuilder:
+    """`nc.gpu.batch(gpu_type="H100", deadline="24h")` then `.map(command, items)`."""
+
+    def __init__(self, c: "Numinous", *, gpu_type: str, deadline: str, gpu_mode: str, labels: dict | None):
+        self._c, self.gpu_type, self.deadline, self.gpu_mode, self.labels = c, gpu_type, deadline, gpu_mode, labels or {}
+
+    def quote(self) -> dict:
+        return self._c._get("/v1/gpu/batches/quote", params={"deadline": self.deadline})
+
+    def map(self, command, items, *, image: str | None = None, template_id: str | None = None,
+            env: dict | None = None, estimate_gpu_seconds: int = 0) -> GpuBatch:
+        """One job per item. `command` is a format string with `{item}` (and
+        `{i}`), or a callable(item) -> str. Each job runs in its own sandbox
+        from `image` or `template_id`."""
+        jobs = []
+        for i, item in enumerate(items):
+            cmd = command(item) if callable(command) else str(command).format(item=item, i=i)
+            jobs.append({"command": cmd, "image": image, "template_id": template_id, "env": env or {},
+                         "estimate_gpu_seconds": estimate_gpu_seconds})
+        data = self._c._post("/v1/gpu/batches", {"gpu_type": self.gpu_type, "gpu_mode": self.gpu_mode, "deadline": self.deadline,
+                                                 "jobs": jobs, "labels": self.labels}, timeout=300)
+        return GpuBatch(self._c, data)
+
+    def submit(self, jobs: list[dict]) -> GpuBatch:
+        """Jobs given explicitly: [{command, image|template_id, env?, estimate_gpu_seconds?}]."""
+        data = self._c._post("/v1/gpu/batches", {"gpu_type": self.gpu_type, "gpu_mode": self.gpu_mode, "deadline": self.deadline,
+                                                 "jobs": jobs, "labels": self.labels}, timeout=300)
+        return GpuBatch(self._c, data)
+
+
+class Gpu:
+    def __init__(self, c: "Numinous"):
+        self._c = c
+
+    def batch(self, *, gpu_type: str = "H100", deadline: str = "24h", gpu_mode: str = "shared",
+              labels: dict | None = None) -> GpuBatchBuilder:
+        """Trade time for a lower price: the longer the deadline, the lower
+        the quoted rate per GPU-hour. `batch.map(run_eval, tasks)`."""
+        return GpuBatchBuilder(self._c, gpu_type=gpu_type, deadline=deadline, gpu_mode=gpu_mode, labels=labels)
+
+    def batches(self, *, state: str | None = None, limit: int = 50) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if state: params["state"] = state
+        return self._c._get("/v1/gpu/batches", params=params)
+
+    def get_batch(self, batch_id: str) -> GpuBatch:
+        return GpuBatch(self._c, self._c._get(f"/v1/gpu/batches/{batch_id}"))
+
+
 class Numinous:
     def __init__(self, api_url: str | None = None, api_key: str | None = None):
         self.api_url = (api_url or os.environ.get(
@@ -916,6 +1267,11 @@ class Numinous:
         self.capacity = Capacity(self)
         self.batches = Batches(self)
         self.stats = Stats(self)
+        self.billing = Billing(self)
+        self.labels = Labels(self)
+        self.cells = Cells(self)
+        self.shares = Shares(self)
+        self.gpu = Gpu(self)
 
     def pricing(self) -> dict:
         return self._get("/v1/pricing")
@@ -953,27 +1309,37 @@ class Numinous:
                             detail.get("message", r.text[:300]), r.status_code,
                             retryable=detail.get("retryable"))
 
-    def _get(self, path: str, params: dict | None = None) -> Any:
-        r = self._http.get(path, params=params)
+    def _send(self, method: str, path: str, **kw) -> Any:
+        """One request, following a cell redirect once. A 421 `misdirected`
+        names the cell this key's org lives in; the client re-homes to that
+        origin for the rest of its life and repeats the request there. One
+        hop only: a cell that bounces back is an operator problem, not a loop."""
+        r = self._http.request(method, path, **kw)
+        if r.status_code == 421:
+            try:
+                detail = r.json().get("detail") or {}
+            except ValueError:
+                detail = {}
+            target = detail.get("api_url") if detail.get("cause") == "misdirected" else None
+            if target and not getattr(self, "_rehomed", False):
+                self._rehomed = True
+                self.api_url = target.rstrip("/")
+                self._http.base_url = self.api_url
+                r = self._http.request(method, path, **kw)
         self._raise_for(r)
         return r.json()
+
+    def _get(self, path: str, params: dict | None = None) -> Any:
+        return self._send("GET", path, params=params)
 
     def _post(self, path: str, body: dict, timeout: float = 120) -> Any:
-        r = self._http.post(path, json=body, timeout=timeout)
-        self._raise_for(r)
-        return r.json()
+        return self._send("POST", path, json=body, timeout=timeout)
 
     def _put(self, path: str, body: dict, timeout: float = 600) -> Any:
-        r = self._http.put(path, json=body, timeout=timeout)
-        self._raise_for(r)
-        return r.json()
+        return self._send("PUT", path, json=body, timeout=timeout)
 
     def _patch(self, path: str, body: dict, timeout: float = 60) -> Any:
-        r = self._http.patch(path, json=body, timeout=timeout)
-        self._raise_for(r)
-        return r.json()
+        return self._send("PATCH", path, json=body, timeout=timeout)
 
     def _delete(self, path: str) -> Any:
-        r = self._http.delete(path)
-        self._raise_for(r)
-        return r.json()
+        return self._send("DELETE", path)

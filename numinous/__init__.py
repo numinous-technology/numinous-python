@@ -14,4 +14,16 @@
 from .client import Attribution, Numinous, NuminousError
 
 __all__ = ["Attribution", "Numinous", "NuminousError"]
-__version__ = "0.1.17"
+
+def _version() -> str:
+    # One source of truth: the installed distribution's metadata, which is
+    # pyproject.toml's version. A literal here fell three releases behind
+    # (0.1.17 while the wheel was 0.1.20) and the CLI reported it.
+    try:
+        from importlib.metadata import version
+        return version("numinous")
+    except Exception:  # noqa: BLE001 - a source checkout that is not installed
+        return "0.0.0+source"
+
+
+__version__ = _version()
