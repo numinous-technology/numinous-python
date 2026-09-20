@@ -261,7 +261,12 @@ class Sandboxes(_Resource):
             # a persistent share of one pooled card (gpu_mode="shared"):
             # SM cap and memory cap, billed by occupancy at that fraction
             body["gpu_fraction"] = float(gpu_fraction)
-        if not wait:
+        # A GPU pod can take minutes to pull its image; holding one HTTP
+        # request open for that lost the sandbox id when the client gave up
+        # (a pod ran unowned for 13 minutes, 2026-09-20). GPU creates are
+        # acknowledged at once and polled here until running or terminal.
+        poll_after = wait and gpu > 0
+        if not wait or poll_after:
             body["wait"] = False
         timeout = 600
         if wait_for_slot is not None:
@@ -271,7 +276,10 @@ class Sandboxes(_Resource):
         delay = 2.0
         while True:
             try:
-                return self._c._post("/v1/sandboxes", body, timeout=timeout)
+                out = self._c._post("/v1/sandboxes", body, timeout=timeout)
+                if poll_after and out.get("state") == "creating":
+                    return self.wait(out["id"], until="running", timeout=1800, poll=5.0)
+                return out
             except NuminousError as e:
                 admission = (e.status == 429 and e.cause == "org_quota") or (
                     e.status == 503 and e.cause == "provider_capacity")
