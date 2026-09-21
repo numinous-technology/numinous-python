@@ -519,9 +519,17 @@ class Sandboxes(_Resource):
         supervisor deciding what is stalled without polling each one."""
         return self._c._post("/v1/sandboxes/activity", {"ids": list(sandbox_ids)})
 
-    def destroy(self, sandbox_id: str) -> dict:
-        """Returns the sandbox with teardown_proof attached."""
-        return self._c._delete(f"/v1/sandboxes/{sandbox_id}")
+    def destroy(self, sandbox_id: str, *, wait: bool = True) -> dict:
+        """Destroy a sandbox. With ``wait`` (default) the call returns once the
+        platform has confirmed the resources are gone, with teardown_proof
+        attached; that includes the final checkpoint flush, so it is given a
+        five minute budget (a loaded host took over 60 s and the old default
+        timed out client-side while the destroy completed, 2026-09-21).
+        ``wait=False`` records the intent and returns at once; poll with
+        ``wait(sandbox_id, until="terminated")`` if you need confirmation."""
+        if not wait:
+            return self._c._delete(f"/v1/sandboxes/{sandbox_id}?wait=0", timeout=60)
+        return self._c._delete(f"/v1/sandboxes/{sandbox_id}", timeout=300)
 
 
     # One inline request is bounded by the control plane's inline_file_max_mib
@@ -1349,5 +1357,5 @@ class Numinous:
     def _patch(self, path: str, body: dict, timeout: float = 60) -> Any:
         return self._send("PATCH", path, json=body, timeout=timeout)
 
-    def _delete(self, path: str) -> Any:
-        return self._send("DELETE", path)
+    def _delete(self, path: str, timeout: float = 60) -> Any:
+        return self._send("DELETE", path, timeout=timeout)
